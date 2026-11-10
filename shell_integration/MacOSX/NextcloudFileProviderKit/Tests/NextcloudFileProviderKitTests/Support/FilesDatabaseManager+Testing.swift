@@ -12,6 +12,80 @@ import Testing
 /// This is the only place in the test target which touches the storage engine. Tests seed and inspect rows through these methods so that an engine change touches one file.
 ///
 extension FilesDatabaseManager {
+    /// Create a store as written before DAV addresses were made relative.
+    static func writeVersionOneStoreForTesting(
+        at url: URL,
+        metadata: [SendableItemMetadata],
+        legacyPaths: [String: String] = [:]
+    ) throws -> String {
+        let queue = try DatabaseQueue(path: url.path)
+        try DatabaseSchema.migrator.migrate(queue, upTo: "v1_initial")
+
+        return try queue.write { db in
+            try db.execute(sql: "PRAGMA user_version = 1")
+
+            for item in metadata {
+                let arguments: StatementArguments = [
+                    item.ocId,
+                    item.account,
+                    item.user,
+                    item.userId,
+                    item.urlBase,
+                    item.serverUrl,
+                    item.serverUrl.precomposedStringWithCanonicalMapping,
+                    legacyPaths[item.ocId] ?? "",
+                    item.fileName,
+                    item.fileName,
+                    item.fileName.precomposedStringWithCanonicalMapping,
+                    item.fileName,
+                    item.etag,
+                    item.directory,
+                    item.visitedDirectory,
+                    item.downloaded,
+                    item.uploaded,
+                    item.keepDownloaded,
+                    item.creationDate.timeIntervalSinceReferenceDate,
+                    item.date.timeIntervalSinceReferenceDate,
+                    item.syncTime.timeIntervalSinceReferenceDate,
+                    item.trashbinDeletionTime.timeIntervalSinceReferenceDate,
+                    item.uploadDate.timeIntervalSinceReferenceDate
+                ]
+                try db.execute(
+                    sql: """
+                    INSERT INTO itemMetadata (
+                        ocId,
+                        account,
+                        user,
+                        userId,
+                        urlBase,
+                        serverUrl,
+                        normalizedServerUrl,
+                        path,
+                        fileName,
+                        fileNameView,
+                        normalizedFileName,
+                        name,
+                        etag,
+                        directory,
+                        visitedDirectory,
+                        downloaded,
+                        uploaded,
+                        keepDownloaded,
+                        creationDate,
+                        date,
+                        syncTime,
+                        trashbinDeletionTime,
+                        uploadDate
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    arguments: arguments
+                )
+            }
+
+            return try StoreIdentityRecord.ensure(in: db)
+        }
+    }
+
     ///
     /// Store a row exactly as given, bypassing duplicate eviction and the inheritance of local flags.
     ///
