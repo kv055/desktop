@@ -8,6 +8,7 @@ extension Enumerator {
     static func handlePagedReadResults(
         files: [NKFile], pageIndex: Int, dbManager: FilesDatabaseManager, log: any FileProviderLogging
     ) -> (metadatas: [SendableItemMetadata]?, error: NKError?) {
+        let logger = FileProviderLogger(category: "Enumerator", log: log)
         // First PROPFIND contains the target item, but we do not want to report this in the
         // retrieved metadatas (the enumeration observers don't expect you to enumerate the
         // target item, hence why we always strip the target item out)
@@ -17,14 +18,13 @@ extension Enumerator {
             var metadata = firstFile.toItemMetadata()
 
             if metadata.directory {
-                // Mark the directory as visited in this request, then persist
-                // while preserving the rest of the local-only state. Skip
-                // preservation of `visitedDirectory` so the just-set `true`
-                // is not overwritten by the existing row's value.
                 metadata.visitedDirectory = true
-                dbManager.addItemMetadataPreservingLocalState(metadata, preserveVisitedDirectory: false)
-            } else {
-                dbManager.addItemMetadataPreservingLocalState(metadata)
+            }
+            do {
+                _ = try dbManager.persistItemMetadataFromPagedListing(metadata, preserveVisitedDirectory: !metadata.directory)
+            } catch {
+                logger.error("Could not persist the listed directory.", [.item: metadata.ocId, .error: error])
+                return (nil, .invalidData)
             }
         }
 
@@ -43,7 +43,7 @@ extension Enumerator {
         //
         // Conversion and persistence are timed separately (convAccum / dbAccum) so the JSONL PERF
         // line splits CPU spent building metadata from CPU spent in the database. Today each item opens its
-        // own write transaction inside `addItemMetadataPreservingLocalState`; `db_items_per_s` is the
+        // own write transaction inside `persistItemMetadataFromPagedListing`; `db_items_per_s` is the
         // throughput number to watch, and the enclosing `ConvertAndPersistPage` signpost bounds the
         // whole page for Instruments. (Phase 2 batches these into one transaction per page.)
         let signposter = EnumerationSignposter.signposter
@@ -65,7 +65,12 @@ extension Enumerator {
             convAccum += clock.now - convStart
 
             let dbStart = clock.now
-            metadatas.append(dbManager.addItemMetadataPreservingLocalState(itemMetadata))
+            do {
+                metadatas.append(try dbManager.persistItemMetadataFromPagedListing(itemMetadata))
+            } catch {
+                logger.error("Could not persist the listed item.", [.item: itemMetadata.ocId, .error: error])
+                return (nil, .invalidData)
+            }
             dbAccum += clock.now - dbStart
         }
 
@@ -74,7 +79,7 @@ extension Enumerator {
         let itemCount = metadatas.count
         let dbSeconds = dbAccum.fpSeconds
         let dbRate = dbSeconds > 0 ? Double(itemCount) / dbSeconds : 0
-        FileProviderLogger(category: "Enumerator", log: log).performance(
+        logger.performance(
             "PERF ConvertAndPersistPage pageIndex=\(pageIndex) items=\(itemCount) conv_s=\(convAccum.fpSeconds) db_s=\(dbSeconds) db_items_per_s=\(dbRate)"
         )
 
@@ -88,7 +93,7 @@ extension Enumerator {
         serverUrl: String,
         account: Account,
         dbManager: FilesDatabaseManager,
-        files filesFromResponse: [NKFile],
+        files: [NKFile],
         pageIndex: Int?,
         preserveDeletedTarget: Bool,
         log: any FileProviderLogging
@@ -104,7 +109,7 @@ extension Enumerator {
         if let pageIndex {
             // Persist off the cooperative pool: see `FilesDatabaseManager.perform(_:)`.
             let (metadatas, error) = await dbManager.perform { dbManager in
-                handlePagedReadResults(files: filesFromResponse, pageIndex: pageIndex, dbManager: dbManager, log: log)
+                handlePagedReadResults(files: files, pageIndex: pageIndex, dbManager: dbManager, log: log)
             }
             return (metadatas, nil, error)
         }
@@ -116,9 +121,9 @@ extension Enumerator {
         let convDirState = signposter.beginInterval(
             "ConvertDirectoryMetadata",
             id: signposter.makeSignpostID(),
-            "serverUrl=\(serverUrl, privacy: .public) files=\(filesFromResponse.count)"
+            "serverUrl=\(serverUrl, privacy: .public) files=\(files.count)"
         )
-        let convertedDirectory = await filesFromResponse.toSendableDirectoryMetadata(requestedDirectoryURL: serverUrl)
+        let convertedDirectory = await files.toSendableDirectoryMetadata(requestedDirectoryURL: serverUrl)
         signposter.endInterval("ConvertDirectoryMetadata", convDirState)
 
         guard var (directory, _, files) = convertedDirectory else {
@@ -141,13 +146,6 @@ extension Enumerator {
 
         directory.visitedDirectory = true
 
-        // Look up cached children by the URL the parser returned as well as the URL we requested.
-        let responseDirectoryURL = filesFromResponse.first { $0.matchesRequestedDirectoryURL(serverUrl) }.map {
-            directory.ocId == NSFileProviderItemIdentifier.rootContainer.rawValue
-                ? $0.serverUrl
-                : $0.serverUrl + "/" + $0.fileName
-        }
-
         files.insert(directory, at: 0)
 
         guard !Task.isCancelled else { return (nil, nil, .cancelled) }
@@ -164,8 +162,7 @@ extension Enumerator {
                 serverUrl: serverUrl,
                 updatedMetadatas: files,
                 keepExistingDownloadState: true,
-                preserveDeletedTarget: preserveDeletedTarget,
-                responseDirectoryURL: responseDirectoryURL
+                preserveDeletedTarget: preserveDeletedTarget
             )
             signposter.endInterval("Depth1BatchWrite", batchWriteState)
 
@@ -323,6 +320,8 @@ extension Enumerator {
                 try await dbManager.addItemMetadataFromRemoteRead(metadata, isCancelled: isCancelled)
             } catch is CancellationError {
                 return RemoteReadResult(error: .cancelled)
+            } catch let error as NKError {
+                return RemoteReadResult(error: error)
             } catch {
                 // A single-item lookup can still return the server result if caching fails.
                 logger.error("Could not persist remote item metadata.", [.item: metadata.ocId, .error: error])

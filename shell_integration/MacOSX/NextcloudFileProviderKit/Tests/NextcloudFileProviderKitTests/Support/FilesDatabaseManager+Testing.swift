@@ -44,6 +44,8 @@ extension FilesDatabaseManager {
                     item.downloaded,
                     item.uploaded,
                     item.keepDownloaded,
+                    item.status,
+                    item.chunkUploadId,
                     item.creationDate.timeIntervalSinceReferenceDate,
                     item.date.timeIntervalSinceReferenceDate,
                     item.syncTime.timeIntervalSinceReferenceDate,
@@ -71,12 +73,14 @@ extension FilesDatabaseManager {
                         downloaded,
                         uploaded,
                         keepDownloaded,
+                        status,
+                        chunkUploadId,
                         creationDate,
                         date,
                         syncTime,
                         trashbinDeletionTime,
                         uploadDate
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     arguments: arguments
                 )
@@ -86,13 +90,64 @@ extension FilesDatabaseManager {
         }
     }
 
+    func storedParentLocationKeysForTesting(ocId: String) throws -> (parentLocation: String, normalizedParentLocation: String)? {
+        try writer.read { db in
+            try Row.fetchOne(
+                db,
+                sql: "SELECT serverUrl, normalizedServerUrl FROM itemMetadata WHERE ocId = ?",
+                arguments: [ocId]
+            ).map { ($0["serverUrl"], $0["normalizedServerUrl"]) }
+        }
+    }
+
+    /// Seed an absolute parent URL and a queued update in the v1 store format.
+    static func writeVersionOneStoreWithQueuedUpdateForTesting(
+        at url: URL,
+        metadata: SendableItemMetadata,
+        legacyPath: String,
+        sessionId: String
+    ) throws -> String {
+        let identity = try writeVersionOneStoreForTesting(
+            at: url,
+            metadata: [metadata],
+            legacyPaths: [metadata.ocId: legacyPath]
+        )
+        let queue = try DatabaseQueue(path: url.path)
+        try queue.write { db in
+            let encoded = try JSONEncoder().encode(metadata)
+            var snapshot = try #require(JSONSerialization.jsonObject(with: encoded) as? [String: Any])
+            snapshot["path"] = legacyPath
+            try ChangeDeliverySessionRecord(
+                sessionId: sessionId,
+                containerKey: "working-set",
+                currentAnchorKey: "old-anchor",
+                finalAnchorRawValue: Data(),
+                incomplete: false,
+                hardRemoveDeleted: false
+            ).insert(db)
+            try ChangeDeliveryItemRecord(
+                sessionId: sessionId,
+                sequence: 0,
+                metadataData: JSONSerialization.data(withJSONObject: snapshot),
+                deleted: false
+            ).insert(db)
+        }
+        return identity
+    }
+
+    func hasLegacyItemPathColumnForTesting() throws -> Bool {
+        try writer.read { db in
+            try db.columns(in: ItemMetadataRecord.databaseTableName).contains { $0.name == "path" }
+        }
+    }
+
     ///
     /// Store a row exactly as given, bypassing duplicate eviction and the inheritance of local flags.
     ///
     /// The normalized location keys are derived from the raw location unless overridden, which builds rows whose keys drifted.
     ///
     func insertForTesting(_ metadata: SendableItemMetadata, normalizedServerUrl: String? = nil, normalizedFileName: String? = nil) throws {
-        var record = ItemMetadataRecord(metadata)
+        var record = ItemMetadataRecord(metadata, domainAccount: account)
 
         if let normalizedServerUrl {
             record.normalizedServerUrl = normalizedServerUrl

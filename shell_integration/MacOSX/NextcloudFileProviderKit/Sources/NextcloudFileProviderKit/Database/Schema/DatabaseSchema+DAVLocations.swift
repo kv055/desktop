@@ -5,6 +5,22 @@ import Foundation
 import GRDB
 
 extension DatabaseSchema {
+    /// Convert full WebDAV parent URLs in item rows and queued item JSON to Files or Trash paths.
+    static func migrateParentURLsToDAVRelativeLocations(in db: Database) throws {
+        try migrateItemParentURLsToDAVRelativeLocations(in: db)
+
+        // Update the queued JSON in SQLite so a malformed session ID does not stop the migration.
+        let migrateSnapshot = DatabaseFunction("migrate_change_delivery_snapshot", argumentCount: 1) { values in
+            guard let data = Data.fromDatabaseValue(values[0]),
+                  let migrated = try ChangeDeliveryItemRecord.migrateLegacySnapshot(data)
+            else { return values[0] }
+            return migrated
+        }
+        db.add(function: migrateSnapshot)
+        defer { db.remove(function: migrateSnapshot) }
+        try db.execute(sql: "UPDATE changeDeliveryItem SET metadataData = migrate_change_delivery_snapshot(metadataData)")
+    }
+
     /// Replace each item's full WebDAV parent URL with a `files:` or `trash:` path.
     /// If a domain account is supplied, use its details to fill missing account fields on matching rows.
     static func migrateItemParentURLsToDAVRelativeLocations(

@@ -42,6 +42,42 @@ extension DatabaseTestSuites {
             #expect(version == StoreVersion.current)
         }
 
+        @Test func anUnreadableLegacyItemDoesNotBlockTheDAVPathMigration() throws {
+            let directory = try #require(manager.databaseURL).deletingLastPathComponent()
+            let domain = UUID().uuidString
+            let url = directory.appendingPathComponent(domain).appendingPathExtension(DatabaseSchema.fileExtension)
+            let healthy = DatabaseTestSuites.makeFile(ocId: "healthy", fileName: "healthy.txt")
+            let damagedName = DatabaseTestSuites.makeFile(ocId: "damaged-name", fileName: "old-name.txt")
+            let damagedID = DatabaseTestSuites.makeFile(ocId: "damaged-id", fileName: "old-id.txt")
+            let invalidUTF8 = Data([0xff])
+            _ = try FilesDatabaseManager.writeVersionOneStoreForTesting(
+                at: url,
+                metadata: [healthy, damagedName, damagedID]
+            )
+
+            let legacy = try DatabaseQueue(path: url.path)
+            try legacy.write { db in
+                try db.execute(
+                    sql: "UPDATE itemMetadata SET fileName = ? WHERE ocId = ?",
+                    arguments: [invalidUTF8, damagedName.ocId]
+                )
+                try db.execute(
+                    sql: "UPDATE itemMetadata SET ocId = CAST(? AS TEXT) WHERE ocId = ?",
+                    arguments: [invalidUTF8, damagedID.ocId]
+                )
+            }
+
+            let reopened = try FilesDatabaseManager(
+                account: DatabaseTestSuites.account,
+                databaseDirectory: directory,
+                fileProviderDomainIdentifier: .init(domain),
+                log: FileProviderLogMock()
+            )
+
+            #expect(reopened.itemMetadata(locatedAtRemoteUrl: healthy.remotePath())?.ocId == healthy.ocId)
+            #expect(try reopened.storedParentLocationKeysForTesting(ocId: healthy.ocId)?.parentLocation == "files:")
+        }
+
         @Test func aCorruptDatabaseFileIsSetAsideAndReplaced() throws {
             let url = try #require(manager.databaseURL)
             let directory = url.deletingLastPathComponent()

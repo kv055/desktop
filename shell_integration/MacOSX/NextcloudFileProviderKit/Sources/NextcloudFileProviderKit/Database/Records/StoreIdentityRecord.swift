@@ -47,44 +47,47 @@ struct StoreIdentityRecord: Codable, Sendable, FetchableRecord, PersistableRecor
             try DatabaseSchema.migrateItemParentURLsToDAVRelativeLocations(in: db, fillingMissingDetailsFrom: sourceAccount)
         }
 
+        // A token acquired under the previous account may be invalid at the new WebDAV URL.
         try db.execute(
             sql: """
             UPDATE itemMetadata
-            SET account = ?,
-                urlBase = ?,
-                user = ?,
-                userId = ?
+            SET account = :currentAccountKey,
+                urlBase = :currentServerURL,
+                user = :currentUsername,
+                userId = :currentBackendUserID,
+                lockToken = CASE
+                    WHEN account <> :currentAccountKey
+                        OR urlBase <> :currentServerURL
+                        OR userId <> :currentBackendUserID
+                    THEN NULL
+                    ELSE lockToken
+                END
             WHERE (
                 serverUrl IN ('files:', 'trash:')
                 OR serverUrl GLOB 'files:/*'
                 OR serverUrl GLOB 'trash:/*'
             )
-                AND account = ?
-                AND urlBase = ?
+                AND account = :previousAccountKey
+                AND urlBase = :previousServerURL
                 AND (
-                    userId = ?
-                    OR ? IS NULL
+                    userId = :previousBackendUserID
+                    OR :previousBackendUserID IS NULL
                 )
                 AND (
-                    account <> ?
-                    OR urlBase <> ?
-                    OR user <> ?
-                    OR userId <> ?
+                    account <> :currentAccountKey
+                    OR urlBase <> :currentServerURL
+                    OR user <> :currentUsername
+                    OR userId <> :currentBackendUserID
                 )
             """,
             arguments: [
-                account.ncKitAccount,
-                account.serverUrl,
-                account.username,
-                account.id,
-                sourceAccount.accountKey,
-                sourceAccount.serverBaseURL,
-                sourceBackendUserID,
-                sourceBackendUserID,
-                account.ncKitAccount,
-                account.serverUrl,
-                account.username,
-                account.id
+                "currentAccountKey": account.ncKitAccount,
+                "currentServerURL": account.serverUrl,
+                "currentUsername": account.username,
+                "currentBackendUserID": account.id,
+                "previousAccountKey": sourceAccount.accountKey,
+                "previousServerURL": sourceAccount.serverBaseURL,
+                "previousBackendUserID": sourceBackendUserID
             ]
         )
         let didRebaseItemRows = db.changesCount > 0
@@ -122,7 +125,7 @@ struct StoreIdentityRecord: Codable, Sendable, FetchableRecord, PersistableRecor
         while let snapshot = try snapshots.next() {
             guard let data: Data = try? snapshot.decode(forColumn: "metadataData"),
                   let deleted: Bool = try? snapshot.decode(forColumn: "deleted"),
-                  let metadata = try? decoder.decode(SendableItemMetadata.self, from: data)
+                  let metadata = try? ChangeDeliveryItemRecord.decodeMetadata(data, using: decoder)
             else { continue }
 
             if deleted && !account.ownsDAVReadURL(metadata.serverUrl, sourceMetadata: metadata) {

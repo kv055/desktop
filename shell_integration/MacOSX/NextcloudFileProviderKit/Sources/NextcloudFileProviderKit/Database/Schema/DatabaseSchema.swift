@@ -196,6 +196,17 @@ enum DatabaseSchema {
             }
         }
 
+        migrator.registerMigration("v2_relative_dav_locations") { db in
+            try db.alter(table: StoreIdentityRecord.databaseTableName) { table in
+                table.add(column: "accountBinding", .blob)
+            }
+            // The extension now derives the WebDAV parent path sent over XPC from the full URL.
+            try db.alter(table: ItemMetadataRecord.databaseTableName) { table in
+                table.drop(column: "path")
+            }
+            try migrateParentURLsToDAVRelativeLocations(in: db)
+        }
+
         return migrator
     }
 }

@@ -141,7 +141,7 @@ extension Enumerator {
         // Track read failures so one unreadable folder no longer aborts the whole scan (see the
         // read-error branch below). `hadReadFailure` is returned to the caller so it can avoid
         // advancing the working-set sync point past changes this pass could not discover.
-        var hadReadFailure = storedMaterialisedItems == nil
+        var hadReadFailure = storedMaterialisedItems == nil || dbManager.hasMaterializedItemsWithOutdatedLegacyDAVAccount()
         var failedItemIds = Set<String>()
 
         // Reads are issued in waves by remote-path depth, so a directory's read is merged before the deeper items it covers are read.

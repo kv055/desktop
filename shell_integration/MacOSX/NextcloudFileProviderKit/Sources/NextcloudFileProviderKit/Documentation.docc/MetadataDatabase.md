@@ -18,7 +18,7 @@ Rows leave the database as ``SendableItemMetadata`` and the other value types; t
 ## Storage choices
 
 - Dates are stored as `REAL` seconds since the reference date, the same number a `Date` holds, so they round-trip exactly. Predicates bind that number, never a `Date`, because GRDB would bind a `Date` as text.
-- The location keys `normalizedServerUrl` and `normalizedFileName` hold the NFC form of the raw location. See <doc:UnicodePathNormalization>.
+- SQLite's `serverUrl` column holds a DAV parent path such as `files:/Docs` or `trash:`. The row decoder combines that path with the server base URL and backend user ID to build the WebDAV request URL. If migration cannot identify a legacy row's DAV root, the row keeps its full parent URL in that column. See <doc:UnicodePathNormalization> for the lookup keys.
 - Items below a directory are matched with a byte-wise range over the location index rather than a pattern, so names with pattern characters or different case never match by accident.
 - Array fields are stored as JSON text. Booleans are integers.
 - Recorded upload chunks are keyed by upload identifier and chunk number and returned in chunk order.
@@ -54,6 +54,8 @@ The store version and the store identity are part of every sync anchor, so after
 ## Store identity
 
 Every database file carries a random identity in its `storeIdentity` table, minted the first time the file is opened and read once per `FilesDatabaseManager`. Together with the store version it is part of every sync anchor the enumerators hand to the framework. An anchor from another file, whether that file was set aside as corrupt, removed after a downgrade or deleted by hand, is answered with `syncAnchorExpired`, so the framework re-enumerates the container instead of taking an empty store for a store without changes. Nothing is reimported, because the item identifiers are the server's `ocId` values and survive the replacement.
+
+When the domain opens with a different Nextcloud login, server base URL, or backend user ID, the database updates the account fields on its relative item rows, assigns a new store identity, and discards pending change batches saved for the previous account in one transaction. The rows keep their item IDs and local state.
 
 ## Import from Realm
 

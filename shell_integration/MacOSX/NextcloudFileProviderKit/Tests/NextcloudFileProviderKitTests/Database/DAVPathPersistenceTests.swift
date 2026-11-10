@@ -5,26 +5,276 @@
 import Foundation
 import GRDB
 @testable import NextcloudFileProviderKit
+import NextcloudFileProviderKitMocks
+import NextcloudKit
 import Testing
+import TestInterface
 
 @Suite("Persisted DAV paths")
 struct DAVPathPersistenceTests {
+    enum EnumerationScope: CaseIterable {
+        case workingSet
+        case teamFolder
+
+        var identifier: NSFileProviderItemIdentifier {
+            switch self {
+                case .workingSet: .workingSet
+                case .teamFolder: .init(DAVPathPersistenceTests.folderId)
+            }
+        }
+    }
+
+    enum DAVAccountChange: CaseIterable {
+        case serverBaseURL
+        case backendUserID
+
+        var accountAfterChange: Account {
+            let old = DAVPathPersistenceTests.oldAccount
+            let current = DAVPathPersistenceTests.currentAccount
+            return Account(
+                user: old.username,
+                id: self == .backendUserID ? current.id : old.id,
+                serverUrl: self == .serverBaseURL ? current.serverUrl : old.serverUrl,
+                password: old.password
+            )
+        }
+    }
+
+    enum QueuedParentFormat: CaseIterable {
+        case absoluteParentURL
+        case relativeParentPath
+    }
+
+    private static let oldAccount = Account(
+        user: "old-login",
+        id: "old-id",
+        serverUrl: "https://old.example.com/cloud",
+        password: "password"
+    )
     private static let currentAccount = Account(
         user: "new-login",
         id: "new-id",
         serverUrl: "https://new.example.com/nextcloud",
         password: "password"
     )
+    private static let folderId = "team-folder-id"
+    private static let folderName = "Team Re\u{0301}ports"
     private static let fileId = "report-id"
     private static let fileName = "Report #1.txt"
+    private static let remoteETag = "new-version"
+    private static let storedETag = "old-version"
 
     private let directory: URL
     private let domain = NSFileProviderDomainIdentifier("dav-paths-\(UUID().uuidString)")
+    private let log = FileProviderLogMock()
 
     init() throws {
         directory = FileManager.default.temporaryDirectory
             .appendingPathComponent(domain.rawValue, isDirectory: true)
         try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+    }
+
+    @Test func legacyDAVPathsMigrateWithoutLosingLocalState() throws {
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let foreign = Account(
+            user: "foreign-login",
+            id: "foreign-id",
+            serverUrl: Self.oldAccount.serverUrl,
+            password: "password"
+        )
+        var foreignFile = DatabaseTestSuites.makeFile(
+            ocId: "foreign-file-id",
+            fileName: "foreign-report.pdf",
+            serverUrl: foreign.davFilesUrl + "/" + Self.folderName,
+            account: foreign
+        )
+        foreignFile.downloaded = true
+        var legacyFile = DatabaseTestSuites.makeFile(
+            ocId: "legacy-file-id",
+            fileName: "legacy-report.pdf",
+            serverUrl: Self.oldAccount.davFilesUrl + "/" + Self.folderName,
+            account: Self.oldAccount
+        )
+        legacyFile.urlBase = ""
+        legacyFile.userId = ""
+        legacyFile.downloaded = true
+        let identity = try writeVersionOneStoreWithMaterializedItems(additionalMetadata: [foreignFile, legacyFile])
+
+        let manager = try openManager()
+        let folder = try #require(manager.itemMetadata(ocId: Self.folderId))
+        let file = try #require(manager.itemMetadata(ocId: Self.fileId))
+        let parentUrl = Self.currentAccount.davFilesUrl + "/" + Self.folderName
+        let storedFolder = try #require(try manager.storedParentLocationKeysForTesting(ocId: Self.folderId))
+        let storedFile = try #require(try manager.storedParentLocationKeysForTesting(ocId: Self.fileId))
+
+        #expect(manager.storeIdentity != identity)
+        #expect(storedFolder.parentLocation == "files:")
+        #expect(storedFile.parentLocation == "files:/" + Self.folderName)
+        #expect(storedFile.normalizedParentLocation.utf8.elementsEqual(("files:/" + Self.folderName).precomposedStringWithCanonicalMapping.utf8))
+        #expect(try manager.hasLegacyItemPathColumnForTesting() == false)
+        #expect(folder.serverUrl == Self.currentAccount.davFilesUrl)
+        #expect(folder.visitedDirectory)
+        #expect(file.serverUrl == parentUrl)
+        #expect(file.davParentPathWithoutOrigin == Self.filesRootPathWithoutOrigin(for: Self.currentAccount) + "/" + Self.folderName + "/")
+        #expect(file.account == Self.currentAccount.ncKitAccount)
+        #expect(file.user == Self.currentAccount.username)
+        #expect(file.userId == Self.currentAccount.id)
+        #expect(file.urlBase == Self.currentAccount.serverUrl)
+        #expect(file.downloaded)
+        #expect(file.keepDownloaded)
+        #expect(file.etag == Self.storedETag)
+        #expect(!file.deleted)
+        #expect(manager.itemMetadata(locatedAtRemoteUrl: parentUrl + "/" + Self.fileName)?.ocId == Self.fileId)
+
+        let migratedLegacyFile = try #require(manager.itemMetadata(locatedAtRemoteUrl: parentUrl + "/" + legacyFile.fileName))
+        #expect(migratedLegacyFile.ocId == legacyFile.ocId)
+        #expect(migratedLegacyFile.account == Self.currentAccount.ncKitAccount)
+        #expect(migratedLegacyFile.downloaded)
+
+        let retainedForeignFile = try #require(manager.itemMetadatas(account: foreign.ncKitAccount).first { $0.ocId == foreignFile.ocId })
+        #expect(manager.itemMetadata(ocId: foreignFile.ocId) == nil)
+        #expect(retainedForeignFile.remotePath() == foreignFile.remotePath())
+        #expect(retainedForeignFile.account == foreign.ncKitAccount)
+        #expect(manager.itemMetadata(locatedAtRemoteUrl: parentUrl + "/" + foreignFile.fileName) == nil)
+        #expect(manager.materialisedItemMetadatas()?.contains { $0.ocId == foreignFile.ocId } == false)
+        let changes = try #require(manager.pendingWorkingSetChanges(since: .distantPast))
+        #expect(changes.updated.contains { $0.ocId == foreignFile.ocId } == false)
+        #expect(changes.deleted.contains { $0.ocId == foreignFile.ocId } == false)
+
+        let reopened = try openManager()
+
+        #expect(reopened.storeIdentity == manager.storeIdentity)
+        #expect(reopened.itemMetadata(ocId: Self.fileId)?.remotePath() == file.remotePath())
+        #expect(try reopened.storedParentLocationKeysForTesting(ocId: Self.fileId)?.parentLocation == storedFile.parentLocation)
+    }
+
+    @Test(arguments: [false, true])
+    func movingLegacyMetadataIntoTheFilesRootStoresRelativeParents(movesDirectory: Bool) throws {
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let account = Self.currentAccount
+        let legacyRootURL = account.serverUrl + "/remote.php/webdav"
+        var folder = DatabaseTestSuites.makeFile(
+            ocId: Self.folderId,
+            fileName: Self.folderName,
+            serverUrl: legacyRootURL,
+            account: account
+        )
+        folder.directory = true
+        folder.uploaded = true
+        folder.visitedDirectory = true
+        folder.account = ""
+        folder.urlBase = ""
+        folder.userId = ""
+        var file = DatabaseTestSuites.makeFile(
+            ocId: Self.fileId,
+            fileName: Self.fileName,
+            serverUrl: folder.remotePath(),
+            account: account
+        )
+        file.account = ""
+        file.urlBase = ""
+        file.userId = ""
+        file.uploaded = true
+        file.downloaded = true
+        file.keepDownloaded = true
+        _ = try FilesDatabaseManager.writeVersionOneStoreForTesting(
+            at: directory.appendingPathComponent(domain.rawValue).appendingPathExtension(DatabaseSchema.fileExtension),
+            metadata: [folder, file]
+        )
+        let manager = try openManager()
+        try #require(manager.itemMetadata(locatedAtRemoteUrl: file.remotePath())?.ocId == file.ocId)
+        try #require(try manager.storedParentLocationKeysForTesting(ocId: file.ocId)?.parentLocation == file.serverUrl)
+
+        let destinationFileParentURL: String
+        let destinationFileParentPath: String
+        if movesDirectory {
+            let movedChildren = try #require(manager.renameDirectoryAndPropagateToChildren(
+                ocId: folder.ocId,
+                newServerUrl: account.davFilesUrl,
+                newFileName: folder.fileName
+            ))
+            destinationFileParentURL = account.davFilesUrl + "/" + folder.fileName
+            destinationFileParentPath = "files:/" + folder.fileName
+            #expect(try manager.storedParentLocationKeysForTesting(ocId: folder.ocId)?.parentLocation == "files:")
+            #expect(movedChildren.map(\.ocId) == [file.ocId])
+            let movedFolder = try #require(manager.itemMetadata(locatedAtRemoteUrl: destinationFileParentURL))
+            #expect(manager.immediateChildItems(directoryMetadata: movedFolder).map(\.ocId) == [file.ocId])
+        } else {
+            manager.renameItemMetadata(
+                ocId: file.ocId,
+                newServerUrl: account.davFilesUrl,
+                newFileName: file.fileName
+            )
+            destinationFileParentURL = account.davFilesUrl
+            destinationFileParentPath = "files:"
+        }
+
+        #expect(try manager.storedParentLocationKeysForTesting(ocId: file.ocId)?.parentLocation == destinationFileParentPath)
+        let movedFile = try #require(manager.itemMetadata(locatedAtRemoteUrl: destinationFileParentURL + "/" + file.fileName))
+        #expect(movedFile.ocId == file.ocId)
+        #expect(movedFile.account == account.ncKitAccount)
+        #expect(movedFile.userId == account.id)
+        #expect(movedFile.downloaded)
+        #expect(movedFile.keepDownloaded)
+        #expect(manager.itemMetadata(locatedAtRemoteUrl: file.remotePath()) == nil)
+    }
+
+    @Test func unverifiedOldHostUploadSurvivesAConflictingListing() async throws {
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let account = Self.currentAccount
+        let oldAccount = Account(
+            user: account.username,
+            id: account.id,
+            serverUrl: Self.oldAccount.serverUrl,
+            password: account.password
+        )
+        var pending = DatabaseTestSuites.makeFile(ocId: Self.fileId, fileName: Self.fileName, account: oldAccount)
+        pending.downloaded = true
+        pending.uploaded = false
+        pending.keepDownloaded = true
+        pending.status = Status.uploadError.rawValue
+        pending.chunkUploadId = "old-host-upload"
+        _ = try FilesDatabaseManager.writeVersionOneStoreForTesting(
+            at: directory.appendingPathComponent(domain.rawValue).appendingPathExtension(DatabaseSchema.fileExtension),
+            metadata: [pending]
+        )
+        savePreviouslyConfiguredAccount(account)
+
+        let manager = try openManager()
+        let remote = MockRemoteInterface(account: account, rootItem: .rootItem(account: account))
+        let enumerator = try Enumerator(
+            enumeratedItemIdentifier: .workingSet,
+            account: account,
+            remoteInterface: remote,
+            dbManager: manager,
+            log: log
+        )
+        let observer = MockEnumerationObserver(enumerator: enumerator)
+        await #expect(throws: NSFileProviderError(.cannotSynchronize)) {
+            try await observer.enumerateItems()
+        }
+        #expect(observer.items.isEmpty)
+
+        var listedFile = DatabaseTestSuites.makeFile(
+            ocId: pending.ocId,
+            fileName: "A different address.txt",
+            account: account
+        )
+        listedFile.uploaded = true
+        #expect(throws: NKError.invalidData) {
+            try manager.persistItemMetadataFromPagedListing(listedFile)
+        }
+        #expect(manager.depth1ReadUpdateItemMetadatas(
+            account: account.ncKitAccount,
+            serverUrl: account.davFilesUrl,
+            updatedMetadatas: [listedFile],
+            keepExistingDownloadState: true
+        ) == nil)
+
+        let retained = try #require(manager.itemMetadatas(account: oldAccount.ncKitAccount).first { $0.ocId == pending.ocId })
+        #expect(retained.status == Status.uploadError.rawValue)
+        #expect(retained.chunkUploadId == pending.chunkUploadId)
+        #expect(retained.keepDownloaded)
     }
 
     @Test func legacyRowsWithMissingAccountDetailsUseDAVRelativeParents() throws {
@@ -76,45 +326,263 @@ struct DAVPathPersistenceTests {
         differentAccount.serverUrl = otherServer.davFilesUrl + "/Docs"
         differentAccount.userId = otherServer.id
 
-        let url = directory.appendingPathComponent(domain.rawValue).appendingPathExtension(DatabaseSchema.fileExtension)
-        let identity = try FilesDatabaseManager.writeVersionOneStoreForTesting(
-            at: url,
+        _ = try FilesDatabaseManager.writeVersionOneStoreForTesting(
+            at: directory.appendingPathComponent(domain.rawValue).appendingPathExtension(DatabaseSchema.fileExtension),
             metadata: [report, trashed, missingAccountKey, outsideRoot, differentAccount]
         )
-        let database = try DatabaseQueue(path: url.path)
-        try database.write { db in
-            try db.alter(table: StoreIdentityRecord.databaseTableName) { table in
-                table.add(column: "accountBinding", .blob)
-            }
-            try DatabaseSchema.migrateItemParentURLsToDAVRelativeLocations(in: db)
-            let boundIdentity = try StoreIdentityRecord.bindStoreToDAVAccount(account, previouslyConfiguredAccount: nil, in: db)
-            #expect(boundIdentity == identity)
 
-            func row(_ ocId: String) throws -> Row {
-                let storedRow = try Row.fetchOne(db, sql: "SELECT * FROM itemMetadata WHERE ocId = ?", arguments: [ocId])
-                return try #require(storedRow)
-            }
+        let manager = try openManager()
+        let storedReport = try #require(try manager.storedParentLocationKeysForTesting(ocId: report.ocId))
+        let restoredReport = try #require(manager.itemMetadata(locatedAtRemoteUrl: report.remotePath()))
+        #expect(storedReport.parentLocation == "files:/Docs")
+        #expect(storedReport.normalizedParentLocation == "files:/Docs")
+        #expect(restoredReport.ocId == report.ocId)
+        #expect(restoredReport.urlBase == account.serverUrl)
+        #expect(restoredReport.userId == account.id)
+        #expect(restoredReport.downloaded)
+        #expect(restoredReport.keepDownloaded)
 
-            let storedReport = try row(report.ocId)
-            #expect(storedReport["serverUrl"] as String == "files:/Docs")
-            #expect(storedReport["normalizedServerUrl"] as String == "files:/Docs")
-            #expect(storedReport["urlBase"] as String == account.serverUrl)
-            #expect(storedReport["userId"] as String == account.id)
-            #expect(storedReport["downloaded"] as Bool)
-            #expect(storedReport["keepDownloaded"] as Bool)
+        let storedTrash = try #require(try manager.storedParentLocationKeysForTesting(ocId: trashed.ocId))
+        let restoredTrash = try #require(manager.itemMetadata(locatedAtRemoteUrl: trashed.remotePath()))
+        #expect(storedTrash.parentLocation == "trash:")
+        #expect(restoredTrash.ocId == trashed.ocId)
+        #expect(restoredTrash.account == account.ncKitAccount)
+        #expect(restoredTrash.user == account.username)
+        #expect(restoredTrash.userId == account.id)
 
-            let storedTrash = try row(trashed.ocId)
-            #expect(storedTrash["serverUrl"] as String == "trash:")
-            #expect(storedTrash["account"] as String == account.ncKitAccount)
-            #expect(storedTrash["user"] as String == account.username)
-            #expect(storedTrash["userId"] as String == account.id)
+        #expect(manager.itemMetadata(ocId: missingAccountKey.ocId)?.account == account.ncKitAccount)
+        #expect(manager.itemMetadata(locatedAtRemoteUrl: missingAccountKey.remotePath())?.ocId == missingAccountKey.ocId)
+        #expect(manager.materialisedItemMetadatas()?.contains { $0.ocId == missingAccountKey.ocId } == true)
 
-            let storedKeyless = try row(missingAccountKey.ocId)
-            #expect(storedKeyless["account"] as String == account.ncKitAccount)
-            #expect(storedKeyless["serverUrl"] as String == "files:/Docs")
-            #expect(try row(outsideRoot.ocId)["serverUrl"] as String == outsideRoot.serverUrl)
-            #expect(try row(differentAccount.ocId)["serverUrl"] as String == differentAccount.serverUrl)
+        #expect(try manager.storedParentLocationKeysForTesting(ocId: outsideRoot.ocId)?.parentLocation == outsideRoot.serverUrl)
+        #expect(manager.itemMetadata(locatedAtRemoteUrl: outsideRoot.remotePath())?.ocId == outsideRoot.ocId)
+        #expect(try manager.storedParentLocationKeysForTesting(ocId: differentAccount.ocId)?.parentLocation == differentAccount.serverUrl)
+        #expect(manager.itemMetadata(ocId: differentAccount.ocId) == nil)
+        #expect(manager.itemMetadata(locatedAtRemoteUrl: differentAccount.remotePath()) == nil)
+        #expect(manager.materialisedItemMetadatas()?.contains { $0.ocId == differentAccount.ocId } == false)
+    }
+
+    @Test func unboundLegacyStoreOnlyRebasesRowsForTheCurrentLogin() throws {
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let current = Self.currentAccount
+        let previousBackend = Account(
+            user: current.username,
+            id: Self.oldAccount.id,
+            serverUrl: current.serverUrl,
+            password: current.password
+        )
+        let oldFile = DatabaseTestSuites.makeFile(
+            ocId: Self.fileId,
+            fileName: Self.fileName,
+            account: previousBackend
+        )
+        let foreignFile = DatabaseTestSuites.makeFile(
+            ocId: "foreign-file-id",
+            fileName: "foreign-report.pdf",
+            account: Self.oldAccount
+        )
+        _ = try FilesDatabaseManager.writeVersionOneStoreForTesting(
+            at: directory.appendingPathComponent(domain.rawValue).appendingPathExtension(DatabaseSchema.fileExtension),
+            metadata: [oldFile, foreignFile]
+        )
+
+        let manager = try openManager()
+
+        #expect(manager.itemMetadata(locatedAtRemoteUrl: current.davFilesUrl + "/" + Self.fileName)?.ocId == Self.fileId)
+        #expect(manager.itemMetadata(locatedAtRemoteUrl: current.davFilesUrl + "/" + foreignFile.fileName) == nil)
+        #expect(manager.itemMetadata(ocId: foreignFile.ocId) == nil)
+        #expect(manager.itemMetadatas(account: Self.oldAccount.ncKitAccount).first { $0.ocId == foreignFile.ocId }?.remotePath() == foreignFile.remotePath())
+    }
+
+    @Test func legacyAccountMatchingUsesTheOriginalLoginBytes() throws {
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let previous = Account(user: "caf\u{00E9}", id: "backend-id", serverUrl: "https://example.com", password: "password")
+        let current = Account(user: "cafe\u{0301}", id: previous.id, serverUrl: previous.serverUrl, password: previous.password)
+        savePreviouslyConfiguredAccount(previous)
+
+        var file = DatabaseTestSuites.makeFile(
+            ocId: Self.fileId,
+            fileName: Self.fileName,
+            serverUrl: previous.davFilesUrl + "/Docs",
+            account: previous
+        )
+        file.urlBase = ""
+        file.userId = ""
+
+        _ = try FilesDatabaseManager.writeVersionOneStoreForTesting(
+            at: directory.appendingPathComponent(domain.rawValue).appendingPathExtension(DatabaseSchema.fileExtension),
+            metadata: [file]
+        )
+
+        let manager = try openManager(account: current)
+        let restored = try #require(manager.itemMetadata(ocId: file.ocId))
+        #expect(restored.account.utf8.elementsEqual(current.ncKitAccount.utf8))
+        #expect(try manager.storedParentLocationKeysForTesting(ocId: file.ocId)?.parentLocation == "files:/Docs")
+    }
+
+    @Test(arguments: DAVAccountChange.allCases)
+    func reopeningAfterDAVAccountChangeRebuildsParentURLsAndDropsQueuedDeletions(change: DAVAccountChange) throws {
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let original = try openManager(account: Self.oldAccount)
+        let oldParent = Self.oldAccount.davFilesUrl + "/" + Self.folderName
+        var file = DatabaseTestSuites.makeFile(
+            ocId: Self.fileId,
+            fileName: Self.fileName,
+            serverUrl: oldParent,
+            account: Self.oldAccount
+        )
+        file.etag = Self.storedETag
+        original.addItemMetadata(file)
+        let staleSession = "pending-old-account-deletion"
+        try #require(original.createChangeDeliverySession(
+            sessionId: staleSession,
+            containerKey: NSFileProviderItemIdentifier.workingSet.rawValue,
+            anchorKey: "old-anchor",
+            finalAnchorRawValue: Data(),
+            updated: [],
+            deleted: [file],
+            incomplete: false,
+            hardRemoveDeleted: true
+        ))
+
+        let stored = try #require(try original.storedParentLocationKeysForTesting(ocId: Self.fileId))
+        #expect(stored.parentLocation == "files:/" + Self.folderName)
+
+        let currentAccount = change.accountAfterChange
+        let reopened = try openManager(account: currentAccount)
+
+        #expect(reopened.storeIdentity != original.storeIdentity)
+        #expect(try reopened.changeDeliverySession(sessionId: staleSession) == nil)
+        let reopenedFile = try #require(reopened.itemMetadata(ocId: Self.fileId))
+        #expect(!reopenedFile.deleted)
+        #expect(reopenedFile.etag == Self.storedETag)
+        #expect(reopenedFile.davParentPathWithoutOrigin == Self.filesRootPathWithoutOrigin(for: currentAccount) + "/" + Self.folderName + "/")
+        #expect(reopenedFile.remotePath() == currentAccount.davFilesUrl + "/" + Self.folderName + "/" + Self.fileName)
+    }
+
+    @Test(arguments: [false, true])
+    func legacyQueuedUpdateReplaysWithAnAbsoluteParentURL(equivalentWebroot: Bool) throws {
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let account = equivalentWebroot
+            ? Account(
+                user: "alice",
+                id: "alice",
+                serverUrl: "https://example.com/caf%C3%A9",
+                password: "password"
+            )
+            : Self.currentAccount
+        let file = DatabaseTestSuites.makeFile(
+            ocId: Self.fileId,
+            fileName: Self.fileName,
+            serverUrl: account.davFilesUrl + "/Docs",
+            account: account
+        )
+        var cachedFile = file
+        if equivalentWebroot {
+            cachedFile.serverUrl = "https://example.com/cafe\u{0301}" + Account.webDavFilesUrlSuffix + account.id + "/Docs"
         }
+        let sessionId = "queued-update"
+        let identity = try FilesDatabaseManager.writeVersionOneStoreWithQueuedUpdateForTesting(
+            at: directory.appendingPathComponent(domain.rawValue).appendingPathExtension(DatabaseSchema.fileExtension),
+            metadata: cachedFile,
+            legacyPath: Self.filesRootPathWithoutOrigin(for: account) + "/Docs/",
+            sessionId: sessionId
+        )
+
+        let manager = try openManager(account: account)
+
+        #expect(manager.storeIdentity == identity)
+        #expect(try manager.hasLegacyItemPathColumnForTesting() == false)
+        #expect(manager.itemMetadata(ocId: file.ocId)?.remotePath() == file.remotePath())
+        let change = try #require(manager.changeDeliveryItems(sessionId: sessionId, fromSequence: 0, limit: 1)?.first)
+        let snapshot = try #require(JSONSerialization.jsonObject(with: change.metadataData) as? [String: Any])
+        #expect(snapshot["path"] == nil)
+        #expect(snapshot["serverUrl"] == nil)
+        #expect(snapshot["parentDAVPath"] as? String == "files:/Docs")
+        try expectQueuedUpdateReplays(from: manager, file: file, sessionId: sessionId)
+    }
+
+    @Test func malformedQueueKeysDoNotPreventOtherChangesFromMigrating() throws {
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let file = DatabaseTestSuites.makeFile(
+            ocId: Self.fileId,
+            fileName: Self.fileName,
+            account: Self.currentAccount
+        )
+        let url = directory.appendingPathComponent(domain.rawValue).appendingPathExtension(DatabaseSchema.fileExtension)
+        let sessionId = "queued-update"
+        _ = try FilesDatabaseManager.writeVersionOneStoreWithQueuedUpdateForTesting(
+            at: url,
+            metadata: file,
+            legacyPath: Self.filesRootPathWithoutOrigin(for: Self.currentAccount) + "/",
+            sessionId: sessionId
+        )
+
+        var staleFile = file
+        staleFile.apply(account: Self.oldAccount)
+        staleFile.serverUrl = Self.oldAccount.davFilesUrl
+        let staleSnapshot = try JSONEncoder().encode(staleFile)
+
+        let legacy = try DatabaseQueue(path: url.path)
+        try legacy.write { db in
+            try db.execute(
+                sql: """
+                    INSERT INTO changeDeliveryItem (sessionId, sequence, metadataData, deleted)
+                    VALUES (CAST(X'FE' AS TEXT), 0, ?, 1)
+                    """,
+                arguments: [staleSnapshot]
+            )
+            try db.execute(sql: """
+                INSERT INTO changeDeliveryItem (sessionId, sequence, metadataData, deleted)
+                VALUES (CAST(X'FF' AS TEXT), 0, X'FF', 0)
+                """)
+        }
+
+        let manager = try openManager()
+        try expectQueuedUpdateReplays(from: manager, file: file, sessionId: sessionId)
+    }
+
+    @Test(arguments: QueuedParentFormat.allCases)
+    func queuedParentsReplayFromAbsoluteURLAndRelativePath(format: QueuedParentFormat) throws {
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let manager = try openManager()
+        let account = Self.currentAccount
+        let file = DatabaseTestSuites.makeFile(
+            ocId: Self.fileId,
+            fileName: Self.fileName,
+            serverUrl: account.davFilesUrl + "/Docs",
+            account: account
+        )
+        let sessionId = "queued-update"
+        let encodedMetadata = try JSONEncoder().encode(file)
+        var snapshot = try #require(JSONSerialization.jsonObject(with: encodedMetadata) as? [String: Any])
+        switch format {
+            case .absoluteParentURL:
+                snapshot["path"] = file.davParentPathWithoutOrigin
+            case .relativeParentPath:
+                snapshot.removeValue(forKey: "serverUrl")
+                snapshot["parentDAVPath"] = "files:/Docs"
+        }
+        let snapshotData = try JSONSerialization.data(withJSONObject: snapshot)
+
+        try manager.writer.write { db in
+            try ChangeDeliverySessionRecord(
+                sessionId: sessionId,
+                containerKey: "working-set",
+                currentAnchorKey: "old-anchor",
+                finalAnchorRawValue: Data(),
+                incomplete: false,
+                hardRemoveDeleted: false
+            ).insert(db)
+            try ChangeDeliveryItemRecord(
+                sessionId: sessionId,
+                sequence: 0,
+                metadataData: snapshotData,
+                deleted: false
+            ).insert(db)
+        }
+
+        try expectQueuedUpdateReplays(from: manager, file: file, sessionId: sessionId)
     }
 
     @Test(arguments: [
@@ -155,15 +623,246 @@ struct DAVPathPersistenceTests {
             metadata: [file, root]
         )
 
-        let database = try DatabaseQueue(path: url.path)
-        try database.write { db in
-            try DatabaseSchema.migrateItemParentURLsToDAVRelativeLocations(in: db)
-            let parentSQL = "SELECT serverUrl FROM itemMetadata WHERE ocId = ?"
-            let storedFileParent = try String.fetchOne(db, sql: parentSQL, arguments: [file.ocId])
-            let storedRootParent = try String.fetchOne(db, sql: parentSQL, arguments: [root.ocId])
+        let manager = try openManager(account: account)
+        let storedFileParent = try manager.storedParentLocationKeysForTesting(ocId: file.ocId)
+        let storedRootParent = try manager.storedParentLocationKeysForTesting(ocId: root.ocId)
 
-            #expect(storedFileParent == (shouldConvert ? "files:/Docs" : responseParentURL))
-            #expect(storedRootParent == (shouldConvert ? "files:" : root.serverUrl))
+        #expect(storedFileParent?.parentLocation == (shouldConvert ? "files:/Docs" : responseParentURL))
+        #expect(storedRootParent?.parentLocation == (shouldConvert ? "files:" : root.serverUrl))
+
+        let byURL = manager.itemMetadata(locatedAtRemoteUrl: account.davFilesUrl + "/Docs/" + file.fileName)
+        #expect(byURL?.ocId == (shouldConvert ? file.ocId : nil))
+        if shouldConvert {
+            let restoredRoot = manager.rootItemMetadata()
+            #expect(restoredRoot?.ocId == root.ocId)
+            #expect(restoredRoot?.remotePath() == account.davFilesUrl)
         }
+    }
+
+    private func expectQueuedUpdateReplays(
+        from manager: FilesDatabaseManager,
+        file: SendableItemMetadata,
+        sessionId: String
+    ) throws {
+        let buffer = ChangeDeliveryBuffer(
+            dbManager: manager,
+            containerKey: "working-set",
+            hardRemoveDeleted: false,
+            log: log
+        )
+        try #require(try buffer.isPrimed(forKey: "old-anchor"))
+        let batch = try #require(buffer.prepareChangeDeliveryBatch(maxItems: 1))
+        #expect(batch.updated.map(\.ocId) == [file.ocId])
+        #expect(batch.updated.map { $0.remotePath() } == [file.remotePath()])
+        #expect(batch.deleted.isEmpty)
+        #expect(!batch.moreComing)
+        buffer.acknowledgeBatch(batch.acknowledgement)
+        #expect(try manager.changeDeliverySession(sessionId: sessionId) == nil)
+    }
+
+    @Test(arguments: [false, true])
+    func migratesBothRootFormsWithoutChangingTheItemID(usesNextcloudKitRootPlaceholder: Bool) throws {
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let old = Account(
+            user: "old-id",
+            id: "old-id",
+            serverUrl: "https://old.example.com/",
+            password: "password"
+        )
+        let filesParentURL = "https://old.example.com" + String(Account.webDavFilesUrlSuffix.dropLast())
+        var root = DatabaseTestSuites.makeFile(
+            ocId: "server-root-id",
+            fileName: usesNextcloudKitRootPlaceholder ? NextcloudKit.shared.nkCommonInstance.rootFileName : old.id,
+            serverUrl: usesNextcloudKitRootPlaceholder ? filesParentURL + "/" + old.id : filesParentURL,
+            account: old
+        )
+        root.directory = !usesNextcloudKitRootPlaceholder
+        root.keepDownloaded = true
+        _ = try FilesDatabaseManager.writeVersionOneStoreForTesting(
+            at: directory.appendingPathComponent(domain.rawValue).appendingPathExtension(DatabaseSchema.fileExtension),
+            metadata: [root],
+            legacyPaths: [root.ocId: Account.webDavFilesUrlSuffix]
+        )
+
+        let account = Self.currentAccount
+        savePreviouslyConfiguredAccount(old)
+        let manager = try openManager()
+        let migrated = try #require(manager.rootItemMetadata())
+        let stored = try #require(try manager.storedParentLocationKeysForTesting(ocId: root.ocId))
+
+        #expect(stored.parentLocation == "files:")
+        #expect(migrated.account == account.ncKitAccount)
+        #expect(migrated.ocId == root.ocId)
+        #expect(migrated.directory)
+        #expect(migrated.keepDownloaded)
+        #expect(migrated.fileName == "/")
+        #expect(migrated.remotePath() == account.davFilesUrl)
+        #expect(manager.itemMetadata(locatedAtRemoteUrl: account.davFilesUrl)?.ocId == root.ocId)
+
+        var synthetic = migrated
+        synthetic.ocId = NSFileProviderItemIdentifier.rootContainer.rawValue
+        manager.addItemMetadata(synthetic)
+
+        var child = DatabaseTestSuites.makeFile(ocId: Self.folderId, fileName: account.id, account: account)
+        child.directory = true
+        child.uploaded = true
+        let changes = try #require(manager.depth1ReadUpdateItemMetadatas(
+            account: account.ncKitAccount,
+            serverUrl: account.davFilesUrl,
+            updatedMetadatas: [migrated, child],
+            keepExistingDownloadState: true
+        ))
+        #expect(changes.deleted.isEmpty)
+        #expect(manager.immediateChildItems(directoryMetadata: migrated).map(\.ocId) == [child.ocId])
+        #expect(manager.childItemCount(directoryMetadata: migrated) == 1)
+
+        let reopened = try openManager()
+        #expect(reopened.itemMetadata(ocId: root.ocId)?.deleted == false)
+        #expect(reopened.itemMetadata(ocId: synthetic.ocId)?.deleted == false)
+    }
+
+    @Test(arguments: EnumerationScope.allCases)
+    func enumerationReadsExistingItemsAtTheCurrentDAVBase(container: EnumerationScope) async throws {
+        defer { try? FileManager.default.removeItem(at: directory) }
+        _ = try writeVersionOneStoreWithMaterializedItems()
+        let manager = try openManager()
+        let remote = makeRemoteWithTeamFolder()
+        let folderUrl = Self.currentAccount.davFilesUrl + "/" + Self.folderName
+        remote.enumerateCallHandler = { path, _, _, _, _, _, _, _ in
+            #expect(path == folderUrl || path == folderUrl + "/" + Self.fileName)
+        }
+
+        let observer = try await enumerateChanges(in: container, manager: manager, remote: remote)
+
+        #expect(remote.readOperationCount > 0)
+        #expect(observer.changedItems.contains { $0.itemIdentifier.rawValue == Self.fileId })
+        #expect(observer.deletedItemIdentifiers.isEmpty)
+        let file = try #require(manager.itemMetadata(ocId: Self.fileId))
+        #expect(file.etag == Self.remoteETag)
+        #expect(!file.deleted)
+        #expect(file.downloaded)
+        #expect(file.keepDownloaded)
+    }
+
+    @Test(arguments: EnumerationScope.allCases)
+    func aMissingItemAtTheCurrentDAVBaseStillReportsDeletion(container: EnumerationScope) async throws {
+        defer { try? FileManager.default.removeItem(at: directory) }
+        _ = try writeVersionOneStoreWithMaterializedItems()
+        let manager = try openManager()
+        let remote = MockRemoteInterface(account: Self.currentAccount, rootItem: .rootItem(account: Self.currentAccount))
+        let folderUrl = Self.currentAccount.davFilesUrl + "/" + Self.folderName
+        remote.enumerateCallHandler = { path, _, _, _, _, _, _, _ in
+            #expect(path == folderUrl || path == folderUrl + "/" + Self.fileName)
+        }
+
+        let observer = try await enumerateChanges(in: container, manager: manager, remote: remote)
+
+        #expect(remote.readOperationCount > 0)
+        #expect(observer.deletedItemIdentifiers.contains(.init(Self.folderId)))
+    }
+
+    private func writeVersionOneStoreWithMaterializedItems(
+        oldAccount: Account = Self.oldAccount,
+        additionalMetadata: [SendableItemMetadata] = []
+    ) throws -> String {
+        savePreviouslyConfiguredAccount(oldAccount)
+        let oldParent = oldAccount.davFilesUrl + "/" + Self.folderName
+        var folder = DatabaseTestSuites.makeFile(
+            ocId: Self.folderId,
+            fileName: Self.folderName,
+            account: oldAccount
+        )
+        folder.directory = true
+        folder.visitedDirectory = true
+        folder.uploaded = true
+        folder.etag = Self.storedETag
+        var file = DatabaseTestSuites.makeFile(
+            ocId: Self.fileId,
+            fileName: Self.fileName,
+            serverUrl: oldParent,
+            account: oldAccount
+        )
+        file.downloaded = true
+        file.uploaded = true
+        file.keepDownloaded = true
+        file.etag = Self.storedETag
+        return try FilesDatabaseManager.writeVersionOneStoreForTesting(
+            at: directory.appendingPathComponent(domain.rawValue).appendingPathExtension(DatabaseSchema.fileExtension),
+            metadata: [folder, file] + additionalMetadata,
+            legacyPaths: [
+                Self.folderId: oldAccount.davFilesUrl,
+                Self.fileId: Self.filesRootPathWithoutOrigin(for: oldAccount) + "/" + Self.folderName + "/"
+            ]
+        )
+    }
+
+    private func savePreviouslyConfiguredAccount(_ account: Account) {
+        var defaults = FileProviderDomainDefaults(identifier: domain, log: log, defaults: DatabaseTestSuites.defaults)
+        defaults.serverUrl = account.serverUrl
+        defaults.user = account.username
+        defaults.userId = account.id
+    }
+
+    private func openManager(account: Account = Self.currentAccount) throws -> FilesDatabaseManager {
+        try FilesDatabaseManager(
+            account: account,
+            databaseDirectory: directory,
+            fileProviderDomainIdentifier: domain,
+            log: log,
+            defaults: DatabaseTestSuites.defaults
+        )
+    }
+
+    private static func filesRootPathWithoutOrigin(for account: Account) -> String {
+        URL(string: account.serverUrl)!.path + Account.webDavFilesUrlSuffix + account.id
+    }
+
+    private func makeRemoteWithTeamFolder() -> MockRemoteInterface {
+        let account = Self.currentAccount
+        let root = MockRemoteItem.rootItem(account: account)
+        let folder = MockRemoteItem(
+            identifier: Self.folderId,
+            versionIdentifier: Self.remoteETag,
+            name: Self.folderName,
+            remotePath: account.davFilesUrl + "/" + Self.folderName,
+            directory: true,
+            account: account.ncKitAccount,
+            username: account.username,
+            userId: account.id,
+            serverUrl: account.serverUrl
+        )
+        let file = MockRemoteItem(
+            identifier: Self.fileId,
+            versionIdentifier: Self.remoteETag,
+            name: Self.fileName,
+            remotePath: folder.remotePath + "/" + Self.fileName,
+            account: account.ncKitAccount,
+            username: account.username,
+            userId: account.id,
+            serverUrl: account.serverUrl
+        )
+        root.children = [folder]
+        folder.parent = root
+        folder.children = [file]
+        file.parent = folder
+        return MockRemoteInterface(account: account, rootItem: root)
+    }
+
+    private func enumerateChanges(
+        in container: EnumerationScope,
+        manager: FilesDatabaseManager,
+        remote: MockRemoteInterface
+    ) async throws -> MockChangeObserver {
+        let enumerator = try Enumerator(
+            enumeratedItemIdentifier: container.identifier,
+            account: Self.currentAccount,
+            remoteInterface: remote,
+            dbManager: manager,
+            log: log
+        )
+        let observer = MockChangeObserver(enumerator: enumerator)
+        let anchor = Enumerator.syncAnchor(at: Date(timeIntervalSinceNow: -60), storeIdentity: manager.storeIdentity)
+        try await observer.enumerateChanges(from: anchor)
+        return observer
     }
 }

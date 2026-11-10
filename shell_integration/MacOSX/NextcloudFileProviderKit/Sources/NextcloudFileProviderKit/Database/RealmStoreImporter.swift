@@ -219,7 +219,7 @@ enum RealmStoreImporter {
                 try ChangeDeliveryItemRecord(
                     sessionId: row.sessionId,
                     sequence: row.sequence,
-                    metadataData: row.metadataData,
+                    metadataData: try ChangeDeliveryItemRecord.migrateLegacySnapshot(row.metadataData) ?? row.metadataData,
                     deleted: row.deleted
                 ).insert(db, onConflict: .ignore)
                 rows += 1
