@@ -217,12 +217,13 @@ struct EnumeratorPersistenceTests {
             serverUrl: origin + configuredWebroot,
             password: "test"
         )
-        let filePath = Account.webDavFilesUrlSuffix + account.id + "/Docs/report.txt"
+        let directoryPath = Account.webDavFilesUrlSuffix + account.id + "/Docs"
+        let filePath = directoryPath + "/report.txt"
+        let directoryURL = try #require(URL(string: account.serverUrl + directoryPath))
         let configuredURL = try #require(URL(string: account.serverUrl + filePath))
         let parsedURL = try #require(URL(string: origin + "/instance/nextcloud" + filePath))
         let ocId = "parser-file-id"
-        let body = Data("""
-        <d:multistatus xmlns:d="DAV:" xmlns:oc="http://owncloud.org/ns">
+        let fileResponse = """
           <d:response>
             <d:href>\(responseWebroot)\(filePath)</d:href>
             <d:propstat>
@@ -233,13 +234,34 @@ struct EnumeratorPersistenceTests {
               <d:status>HTTP/1.1 200 OK</d:status>
             </d:propstat>
           </d:response>
+        """
+        let body = Data("""
+        <d:multistatus xmlns:d="DAV:" xmlns:oc="http://owncloud.org/ns">
+        \(fileResponse)
+        </d:multistatus>
+        """.utf8)
+        let listingBody = Data("""
+        <d:multistatus xmlns:d="DAV:" xmlns:oc="http://owncloud.org/ns">
+          <d:response>
+            <d:href>\(responseWebroot)\(directoryPath)/</d:href>
+            <d:propstat>
+              <d:prop>
+                <oc:id>parser-directory-id</oc:id>
+                <d:resourcetype><d:collection/></d:resourcetype>
+              </d:prop>
+              <d:status>HTTP/1.1 200 OK</d:status>
+            </d:propstat>
+          </d:response>
+        \(fileResponse)
         </d:multistatus>
         """.utf8)
         MockHTTPURLProtocol.setResponse(for: configuredURL, statusCode: 207, body: body)
         MockHTTPURLProtocol.setResponse(for: parsedURL, statusCode: 207, body: body)
+        MockHTTPURLProtocol.setResponse(for: directoryURL, statusCode: 207, body: listingBody)
         defer {
             MockHTTPURLProtocol.removeResponse(for: configuredURL)
             MockHTTPURLProtocol.removeResponse(for: parsedURL)
+            MockHTTPURLProtocol.removeResponse(for: directoryURL)
         }
 
         let remote = nextcloudKitForDAVRead(account: account)
@@ -251,19 +273,65 @@ struct EnumeratorPersistenceTests {
         try #require(metadata.urlBase == account.serverUrl)
 
         let manager = DatabaseTestSuites.makeManager(account: account)
-        let result = await Enumerator.readServerUrl(
-            parsedURL.absoluteString,
-            account: account,
-            sourceMetadata: metadata,
-            remoteInterface: remote,
-            dbManager: manager,
-            depth: .target,
-            log: FileProviderLogMock()
-        )
+        func readParsedURL(dbManager: FilesDatabaseManager) async -> RemoteReadResult {
+            await Enumerator.readServerUrl(
+                parsedURL.absoluteString,
+                account: account,
+                sourceMetadata: metadata,
+                remoteInterface: remote,
+                dbManager: dbManager,
+                depth: .target,
+                log: FileProviderLogMock()
+            )
+        }
 
-        #expect(MockHTTPURLProtocol.requests(for: parsedURL).map(\.httpMethod) == ["PROPFIND"])
+        let result = await readParsedURL(dbManager: manager)
         #expect(result.error == nil)
         #expect(result.metadatas?.map(\.ocId) == [ocId])
+
+        let previousAccount = Account(
+            user: account.username,
+            id: account.id,
+            serverUrl: "https://previous.example.invalid",
+            password: account.password
+        )
+        var previousUpload = try #require(manager.itemMetadata(ocId: ocId))
+        previousUpload.status = Status.uploadError.rawValue
+        previousUpload.uploaded = false
+        previousUpload.chunkUploadId = "pending-upload"
+        previousUpload.apply(account: previousAccount)
+        previousUpload.serverUrl = previousAccount.davFilesUrl + "/Docs"
+        let domain = NSFileProviderDomainIdentifier("dav-alias-\(UUID().uuidString)")
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent(domain.rawValue, isDirectory: true)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let databaseURL = directory.appendingPathComponent(domain.rawValue).appendingPathExtension(DatabaseSchema.fileExtension)
+        _ = try FilesDatabaseManager.writeVersionOneStoreForTesting(at: databaseURL, metadata: [previousUpload])
+        let migrated = try FilesDatabaseManager(
+            account: account,
+            databaseDirectory: directory,
+            fileProviderDomainIdentifier: domain,
+            log: FileProviderLogMock(),
+            defaults: DatabaseTestSuites.defaults
+        )
+
+        #expect(migrated.itemMetadata(ocId: ocId) == nil)
+        let recoveredResult = await Enumerator.readServerUrl(
+            directoryURL.absoluteString,
+            account: account,
+            remoteInterface: remote,
+            dbManager: migrated,
+            depth: .targetAndDirectChildren,
+            log: FileProviderLogMock()
+        )
+        #expect(recoveredResult.error == nil)
+        let recovered = try #require(migrated.itemMetadata(ocId: ocId))
+        #expect(recovered.account == account.ncKitAccount)
+        #expect(recovered.hasUnfinishedUpload)
+        #expect(recovered.chunkUploadId == previousUpload.chunkUploadId)
+        #expect(MockHTTPURLProtocol.requests(for: directoryURL).map(\.httpMethod) == ["PROPFIND"])
+        #expect(MockHTTPURLProtocol.requests(for: parsedURL).map(\.httpMethod) == ["PROPFIND"])
     }
 
     @Test(arguments: [(false, true), (true, true), (false, false), (true, false)])

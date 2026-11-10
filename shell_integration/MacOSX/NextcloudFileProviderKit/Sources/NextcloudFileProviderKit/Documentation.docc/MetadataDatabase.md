@@ -55,7 +55,15 @@ The store version and the store identity are part of every sync anchor, so after
 
 Every database file carries a random identity in its `storeIdentity` table, minted the first time the file is opened and read once per `FilesDatabaseManager`. Together with the store version it is part of every sync anchor the enumerators hand to the framework. An anchor from another file, whether that file was set aside as corrupt, removed after a downgrade or deleted by hand, is answered with `syncAnchorExpired`, so the framework re-enumerates the container instead of taking an empty store for a store without changes. Nothing is reimported, because the item identifiers are the server's `ocId` values and survive the replacement.
 
-When the domain opens with a different Nextcloud login, server base URL, or backend user ID, the database updates the account fields on its relative item rows, assigns a new store identity, and discards pending change batches saved for the previous account in one transaction. The rows keep their item IDs and local state.
+When the domain opens with different account details, the database can update rows it can match to the previous account. It changes their account fields, assigns a new store identity, and discards pending change batches saved for the previous account in one transaction. The rows keep their item IDs and local state.
+
+## Recovering item metadata after a server URL change
+
+An older extension could save `https://new.example.com` in the domain settings and reopen the same database, leaving item metadata rows tied to `https://old.example.com`. On upgrade, the database can still read the previous URL from each row and convert its parent path to a value like `files:/Team`. With the previous URL already overwritten in the domain settings, it cannot establish which old rows belong to the current account during startup.
+
+Ordinary directory listings on the current server can recover old rows with the same login and backend user ID. A listed item must match the cached `ocId` and type. A listing of the new parent can recover a moved item while keeping its ID, download flag, and "Always keep downloaded" setting. An unfinished upload can be recovered at its original path.
+
+Finder retries the working-set snapshot while a downloaded file or visited folder is still awaiting a directory listing. A direct request for an unresolved item also asks Finder to retry until a directory listing recovers it. Working-set change scans leave unresolved rows in the database and can recover them when they list a folder that contains them.
 
 ## Import from Realm
 

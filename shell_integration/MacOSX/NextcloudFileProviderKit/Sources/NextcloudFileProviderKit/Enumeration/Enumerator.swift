@@ -33,7 +33,6 @@ import NextcloudKit
 ///
 public final class Enumerator: NSObject, NSFileProviderEnumerator, Sendable {
     let enumeratedItemIdentifier: NSFileProviderItemIdentifier
-    /// Internal (not private) so the concern-specific extensions in sibling files can read it.
     let enumeratedItemMetadata: SendableItemMetadata?
 
     private var enumeratingSystemIdentifier: Bool {
@@ -101,18 +100,17 @@ public final class Enumerator: NSObject, NSFileProviderEnumerator, Sendable {
         } else {
             // Finder opens the Files root with `.rootContainer` above. The server's root ocId
             // is kept for DAV metadata, so reject it as a Finder container identifier.
-            enumeratedItemMetadata = try dbManager.itemMetadataForFileProvider(enumeratedItemIdentifier)
-
-            guard let enumeratedItemMetadata,
-                  !enumeratedItemMetadata.deleted,
-                  !enumeratedItemMetadata.isFilesRootWithServerID
-            else {
-                logger.error("Could not find item with identifier.", [.item: enumeratedItemIdentifier])
-                throw NSFileProviderError(.noSuchItem)
+            switch try dbManager.lookupItemMetadataIncludingPreviousServerRows(for: enumeratedItemIdentifier) {
+                case .currentAccount(let metadata) where !metadata.deleted && !metadata.isFilesRootWithServerID:
+                    logger.debug("Providing enumerator for item with identifier.", [.item: enumeratedItemIdentifier, .name: metadata.fileName])
+                    serverUrl = metadata.remotePath()
+                    enumeratedItemMetadata = metadata
+                case .awaitingDirectoryListing:
+                    throw NSFileProviderError(.cannotSynchronize)
+                case .currentAccount, .missing:
+                    logger.error("Could not find item with identifier.", [.item: enumeratedItemIdentifier])
+                    throw NSFileProviderError(.noSuchItem)
             }
-
-            logger.debug("Providing enumerator for item with identifier.", [.item: enumeratedItemIdentifier, .name: enumeratedItemMetadata.fileName])
-            serverUrl = enumeratedItemMetadata.remotePath()
         }
 
         logger.info("Set up enumerator.", [.account: self.account.ncKitAccount, .url: serverUrl])

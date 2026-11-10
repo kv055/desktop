@@ -31,9 +31,9 @@ as far as the file provider framework is concerned the server genuinely is unrea
 framework already knows how to behave — it presents the situation to the user, throttles the items
 it could not sync, and retries once the extension says the trouble has passed.
 
-Five requests are refused:
+The extension refuses the following requests when they need the server.
 
-| Request | Direction |
+| Request | Why it needs the server |
 | --- | --- |
 | ``FileProviderExtension/enumerator(for:request:)`` | remote changes arriving |
 | ``FileProviderExtension/fetchContents(for:version:request:completionHandler:)`` | downloads |
@@ -48,9 +48,7 @@ sends the extension carries no data. It signals the working set, the framework i
 the framework then asks the extension for an enumerator. Declining that request declines everything
 which was discovered, whichever way it was discovered, and the app needs to know nothing about it.
 
-Looking an item up is deliberately **not** refused. It is answered from the local database, so the
-Finder keeps showing the name and size of everything already known. Classic sync does not hide what
-it has while it is paused, and neither should this.
+Item lookups can use rows that belong to the current account when their parents are also cached. Items that still belong to the previous server wait for an ordinary directory listing. See <doc:MetadataDatabase>.
 
 ## What blocking does not do
 

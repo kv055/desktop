@@ -492,7 +492,7 @@ public final class Item: NSObject, NSFileProviderItem, Sendable {
         isCancelled: @Sendable @escaping () -> Bool = { Task.isCancelled },
         log: any FileProviderLogging
     ) async -> Item? {
-        try? await resolveStoredItem(
+        try? await lookupResolvingParent(
             identifier: identifier,
             account: account,
             remoteInterface: remoteInterface,
@@ -503,12 +503,16 @@ public final class Item: NSObject, NSFileProviderItem, Sendable {
         )
     }
 
-    static func resolveStoredItem(
+    /// Get the item for a File Provider request and report lookup errors to the caller.
+    /// Items from the previous server wait for a directory listing to confirm their IDs.
+    /// An item waiting for a directory listing returns `serverUnreachable` while synchronization is paused.
+    static func lookupResolvingParent(
         identifier: NSFileProviderItemIdentifier,
         account: Account,
         remoteInterface: RemoteInterface,
         dbManager: FilesDatabaseManager,
         includeDeleted: Bool = true,
+        allowsRemoteLookup: Bool = true,
         unresolvedParentError: any Error = NSFileProviderError(.cannotSynchronize),
         taskHandler: @Sendable @escaping (URLSessionTask) -> Void = { _ in },
         isCancelled: @Sendable @escaping () -> Bool = { Task.isCancelled },
@@ -521,19 +525,18 @@ public final class Item: NSObject, NSFileProviderItem, Sendable {
         }
 
         try checkCancellation()
-        let remoteSupportsTrash = await remoteInterface.supportsTrash(account: account)
-        try checkCancellation()
-
-        guard identifier != .rootContainer else {
-            return Item.rootContainer(
-                account: account,
-                remoteInterface: remoteInterface,
-                dbManager: dbManager,
-                remoteSupportsTrash: remoteSupportsTrash,
-                log: log
-            )
-        }
-        guard identifier != .trashContainer else {
+        if identifier == .rootContainer || identifier == .trashContainer {
+            let remoteSupportsTrash = await remoteInterface.supportsTrash(account: account)
+            try checkCancellation()
+            if identifier == .rootContainer {
+                return Item.rootContainer(
+                    account: account,
+                    remoteInterface: remoteInterface,
+                    dbManager: dbManager,
+                    remoteSupportsTrash: remoteSupportsTrash,
+                    log: log
+                )
+            }
             return Item.trashContainer(
                 remoteInterface: remoteInterface,
                 account: account,
@@ -543,12 +546,27 @@ public final class Item: NSObject, NSFileProviderItem, Sendable {
             )
         }
 
-        guard let metadata = try dbManager.itemMetadataForFileProvider(identifier, retryError: unresolvedParentError),
-              !metadata.isFilesRootWithServerID,
-              includeDeleted || !metadata.deleted
-        else {
-            throw NSError.fileProviderErrorForNonExistentItem(withIdentifier: identifier)
+        let lookup: FilesDatabaseManager.ItemMetadataLookupResult
+        do {
+            lookup = try dbManager.lookupItemMetadataIncludingPreviousServerRows(for: identifier)
+        } catch {
+            throw unresolvedParentError
         }
+
+        let metadata: SendableItemMetadata
+        switch lookup {
+            case .currentAccount(let current) where !current.isFilesRootWithServerID && (includeDeleted || !current.deleted):
+                metadata = current
+            case .awaitingDirectoryListing:
+                throw allowsRemoteLookup ? unresolvedParentError : NSFileProviderError(.serverUnreachable)
+            case .currentAccount, .missing:
+                throw NSError.fileProviderErrorForNonExistentItem(withIdentifier: identifier)
+        }
+
+        try checkCancellation()
+
+        let remoteSupportsTrash = await remoteInterface.supportsTrash(account: account)
+        try checkCancellation()
 
         let parentItemIdentifier: NSFileProviderItemIdentifier? = if metadata.isTrashed {
             .trashContainer

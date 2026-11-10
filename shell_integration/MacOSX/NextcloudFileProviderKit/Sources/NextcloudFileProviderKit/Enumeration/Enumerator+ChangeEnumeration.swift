@@ -14,9 +14,8 @@ extension Enumerator {
     /// Read the container from the server, diff it against the local database and report the
     /// resulting creations, updates and deletions to the change observer.
     ///
-    /// A 404 is treated as a deletion of the container itself (reported, not an error). A
-    /// "no changed etags" reply finishes cleanly with no changes. A `nil` change set means the
-    /// database write that derives the changes failed and is reported as an error.
+    /// A 404 from the folder listing reports the folder as deleted.
+    /// A `nil` change set means the database write that derives the changes failed.
     ///
     func enumerateContainerChanges(
         for observer: NSFileProviderChangeObserver, anchor: NSFileProviderSyncAnchor
@@ -72,7 +71,7 @@ extension Enumerator {
                     logger.info("404 error means item no longer exists. Deleting metadata and reporting deletion without error.", [.url: serverUrl])
 
                     guard let itemMetadata = enumeratedItemMetadata else {
-                        logger.error("Invalid enumeratedItemMetadata. Could not delete metadata nor report deletion.")
+                        logger.error("Missing folder metadata. Could not report deletion.")
                         observer.finishEnumeratingWithError(error)
                         return
                     }

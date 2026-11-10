@@ -3,6 +3,7 @@
 
 @preconcurrency import FileProvider
 import Foundation
+import NextcloudKit
 
 ///
 /// How many working-set scan reads may be in flight at once, equal to NextcloudKit's default per-host connection limit on the data session that downloads and uploads share, so on an HTTP/1.1 server a transfer started during a scan waits for a scan read to finish.
@@ -129,8 +130,10 @@ extension Enumerator {
         // Visited folders and downloaded files. Sort in terms of their remote URLs.
         // This way we ensure we visit parent folders before their children.
         // A failed read counts as a read failure of the whole scan, so the sync point does not advance past changes this pass could not see.
-        let storedMaterialisedItems = dbManager.materialisedItemMetadatas()
-        let materialisedItems = (storedMaterialisedItems ?? [])
+        // Read only items already tied to the current account. A normal directory listing can
+        // rediscover a child from the previous server without making a separate request for it.
+        let storedWorkingSet = dbManager.itemMetadataForWorkingSetChangeScan()
+        let materialisedItems = (storedWorkingSet?.items ?? [])
             .filter { !$0.deleted && !$0.isTrashed }
             .sorted { $0.remotePath().count < $1.remotePath().count }
 
@@ -138,11 +141,11 @@ extension Enumerator {
         var accumulatedUpdates = [SendableItemMetadata]()
         var accumulatedDeletions = [SendableItemMetadata]()
         var scannedItemIds = Set<String>()
+        var failedItemIds = Set<String>()
         // Track read failures so one unreadable folder no longer aborts the whole scan (see the
         // read-error branch below). `hadReadFailure` is returned to the caller so it can avoid
         // advancing the working-set sync point past changes this pass could not discover.
-        var hadReadFailure = storedMaterialisedItems == nil || dbManager.hasMaterializedItemsWithOutdatedLegacyDAVAccount()
-        var failedItemIds = Set<String>()
+        var hadReadFailure = storedWorkingSet?.hasOutdatedAbsoluteURLs ?? true
 
         // Reads are issued in waves by remote-path depth, so a directory's read is merged before the deeper items it covers are read.
         func remotePathDepth(_ metadata: SendableItemMetadata) -> Int {
@@ -183,7 +186,20 @@ extension Enumerator {
 
             guard !toRead.isEmpty else { continue }
 
-            await concurrentlyReadForWorkingSetScan(toRead) { itemToScan, readResult in
+            await concurrentlyReadForWorkingSetScan(
+                toRead,
+                read: { item in
+                    await Enumerator.readServerUrl(
+                        item.remotePath(),
+                        account: self.account,
+                        sourceMetadata: item,
+                        remoteInterface: self.remoteInterface,
+                        dbManager: self.dbManager,
+                        depth: item.directory ? .targetAndDirectChildren : .target,
+                        log: self.logger.log
+                    )
+                }
+            ) { itemToScan, readResult in
                 // A sibling merged earlier in this wave covers this item when the server moved it into that sibling or onto its path.
                 guard !scannedItemIds.contains(itemToScan.ocId) else { return }
 
@@ -326,29 +342,19 @@ extension Enumerator {
         return (updated: discoveredUpdates, deleted: reportedDeletions, hadFailure: hadReadFailure)
     }
 
-    /// Read `items` from the server, at most ``workingSetScanConcurrency`` at a time, handing each result to `merge` as it arrives.
-    private func concurrentlyReadForWorkingSetScan(
-        _ items: [SendableItemMetadata],
-        merge: (SendableItemMetadata, RemoteReadResult) -> Void
+    /// Limit concurrent reads, passing each result to `merge` as it arrives.
+    private func concurrentlyReadForWorkingSetScan<Input: Sendable>(
+        _ items: [Input],
+        read: @Sendable @escaping (Input) async -> RemoteReadResult,
+        merge: (Input, RemoteReadResult) -> Void
     ) async {
-        await withTaskGroup(of: (SendableItemMetadata, RemoteReadResult).self) { group in
+        await withTaskGroup(of: (Input, RemoteReadResult).self) { group in
             for (index, item) in items.enumerated() {
                 if index >= workingSetScanConcurrency, let (readItem, result) = await group.next() {
                     merge(readItem, result)
                 }
 
-                group.addTask {
-                    let result = await Enumerator.readServerUrl(
-                        item.remotePath(),
-                        account: self.account,
-                        sourceMetadata: item,
-                        remoteInterface: self.remoteInterface,
-                        dbManager: self.dbManager,
-                        depth: item.directory ? .targetAndDirectChildren : .target,
-                        log: self.logger.log
-                    )
-                    return (item, result)
-                }
+                group.addTask { (item, await read(item)) }
             }
 
             for await (readItem, result) in group {

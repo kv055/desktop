@@ -45,6 +45,18 @@ struct DAVPathPersistenceTests {
         case relativeParentPath
     }
 
+    enum DAVReadScope: CaseIterable {
+        case item
+        case directory
+        case paginatedDirectory
+    }
+
+    enum MovedFileScenario: CaseIterable {
+        case missingAtCachedPath
+        case replacementAtCachedPath
+        case unfinishedUpload
+    }
+
     private static let oldAccount = Account(
         user: "old-login",
         id: "old-id",
@@ -254,6 +266,7 @@ struct DAVPathPersistenceTests {
             try await observer.enumerateItems()
         }
         #expect(observer.items.isEmpty)
+        #expect(remote.readOperationCount == 0)
 
         var listedFile = DatabaseTestSuites.makeFile(
             ocId: pending.ocId,
@@ -761,9 +774,509 @@ struct DAVPathPersistenceTests {
         #expect(observer.deletedItemIdentifiers.contains(.init(Self.folderId)))
     }
 
+    @Test(arguments: [true, false])
+    func workingSetWaitsForDirectoryListingWithMatchingItemID(itemIDMatches: Bool) async throws {
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let account = Self.currentAccount
+        let previous = try writeLegacyStoreWithOutdatedDAVHost()
+        let manager = try openManager()
+        let remote = makeRemoteWithTeamFolder()
+        let remoteFile = try #require(remote.rootItem?.children.first?.children.first)
+        if !itemIDMatches {
+            remoteFile.identifier = "replacement-item"
+        }
+        let folderURL = account.davFilesUrl + "/" + Self.folderName
+        remote.enumerateCallHandler = { path, depth, _, _, _, _, _, _ in
+            #expect(path == folderURL)
+            #expect(depth == .targetAndDirectChildren)
+        }
+
+        let observer = try await enumerateChanges(in: .workingSet, manager: manager, remote: remote)
+        #expect(remote.readOperationCount == 0)
+        #expect(observer.changedItems.isEmpty)
+        #expect(observer.deletedItemIdentifiers.isEmpty)
+        #expect(manager.itemMetadata(ocId: Self.fileId) == nil)
+
+        let listing = await listDirectory(folderURL, manager: manager, remote: remote)
+        #expect(listing.error == nil)
+        #expect(remote.readOperationCount == 1)
+        #expect(listing.changes?.deleted.isEmpty == true)
+        if itemIDMatches {
+            let recovered = try #require(manager.itemMetadata(ocId: Self.fileId))
+            #expect(recovered.remotePath() == remoteFile.remotePath)
+            #expect(recovered.downloaded)
+            #expect(recovered.keepDownloaded)
+            #expect(recovered.etag == Self.remoteETag)
+            #expect(listing.changes?.updated.contains { $0.ocId == Self.fileId } == true)
+        } else {
+            #expect(manager.itemMetadata(ocId: Self.fileId) == nil)
+            let oldRow = try #require(manager.itemMetadatas(account: previous.ncKitAccount).first { $0.ocId == Self.fileId })
+            #expect(!oldRow.deleted)
+            #expect(oldRow.downloaded)
+            #expect(listing.metadatas?.contains { $0.ocId == remoteFile.identifier } == true)
+        }
+    }
+
+    @Test func directoryReadReportsRecoveredDownloadAndPinFlags() async throws {
+        defer { try? FileManager.default.removeItem(at: directory) }
+        _ = try writeLegacyStoreWithOutdatedDAVHost()
+        let manager = try openManager()
+        let remote = makeRemoteWithTeamFolder()
+        let account = Self.currentAccount
+
+        let result = await Enumerator.readServerUrl(
+            account.davFilesUrl + "/" + Self.folderName,
+            account: account,
+            remoteInterface: remote,
+            dbManager: manager,
+            depth: .targetAndDirectChildren,
+            log: log
+        )
+
+        #expect(result.error == nil)
+        let reported = try #require(result.metadatas?.first { $0.ocId == Self.fileId })
+        let saved = try #require(manager.itemMetadata(ocId: Self.fileId))
+        #expect(reported.downloaded && saved.downloaded)
+        #expect(reported.keepDownloaded && saved.keepDownloaded)
+        #expect(result.changes?.updated.contains { $0.ocId == Self.fileId } == true)
+    }
+
+    @Test(arguments: [false, true])
+    func targetReadLeavesPreviousServerRowUnchanged(fileMoved: Bool) async throws {
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let previous = try writeLegacyStoreWithOutdatedDAVHost()
+        let manager = try openManager()
+        let remote = makeRemoteWithTeamFolder()
+        let file = try #require(remote.rootItem?.children.first?.children.first)
+        let account = Self.currentAccount
+        if fileMoved {
+            file.name = "Renamed report.txt"
+            file.remotePath = account.davFilesUrl + "/" + Self.folderName + "/" + file.name
+        }
+
+        let result = await Enumerator.readServerUrl(
+            file.remotePath,
+            account: account,
+            remoteInterface: remote,
+            dbManager: manager,
+            depth: .target,
+            log: log
+        )
+
+        #expect(result.error == .invalidData)
+        #expect(manager.itemMetadata(ocId: Self.fileId) == nil)
+        let oldRow = try #require(manager.itemMetadatas(account: previous.ncKitAccount).first { $0.ocId == Self.fileId })
+        #expect(oldRow.fileName == Self.fileName)
+        #expect(oldRow.downloaded && oldRow.keepDownloaded)
+    }
+
+    @Test func finderWaitsForDirectoryListingsBeforeOpeningOnlineOnlyItems() async throws {
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let previous = try writeLegacyStoreWithOutdatedDAVHost(materialised: false)
+        let manager = try openManager()
+        let remote = makeRemoteWithTeamFolder()
+        let account = Self.currentAccount
+        let fileID = NSFileProviderItemIdentifier(Self.fileId)
+        let folderID = NSFileProviderItemIdentifier(Self.folderId)
+        let folderURL = account.davFilesUrl + "/" + Self.folderName
+
+        func lookupFile() async throws -> Item {
+            try await Item.lookupResolvingParent(
+                identifier: fileID,
+                account: account,
+                remoteInterface: remote,
+                dbManager: manager,
+                log: log
+            )
+        }
+
+        func openFolder() throws -> Enumerator {
+            try Enumerator(
+                enumeratedItemIdentifier: folderID,
+                account: account,
+                remoteInterface: remote,
+                dbManager: manager,
+                log: log
+            )
+        }
+
+        await #expect(throws: NSFileProviderError(.cannotSynchronize)) {
+            try await lookupFile()
+        }
+        #expect(throws: NSFileProviderError(.cannotSynchronize)) {
+            try openFolder()
+        }
+        #expect(remote.readOperationCount == 0)
+        #expect(manager.itemMetadatas(account: previous.ncKitAccount).contains { $0.ocId == Self.fileId && !$0.deleted })
+
+        let rootListing = await listDirectory(account.davFilesUrl, manager: manager, remote: remote)
+        #expect(rootListing.error == nil)
+        #expect(manager.itemMetadata(ocId: Self.folderId)?.remotePath() == folderURL)
+        #expect(manager.itemMetadata(ocId: Self.fileId) == nil)
+        #expect(remote.readOperationCount == 1)
+
+        let observer = MockEnumerationObserver(enumerator: try openFolder())
+        try await observer.enumerateItems()
+        #expect(observer.items.contains { $0.itemIdentifier == fileID })
+        #expect(remote.readOperationCount == 2)
+
+        let file = try await lookupFile()
+        #expect(file.metadata.remotePath() == folderURL + "/" + Self.fileName)
+        #expect(!file.metadata.downloaded)
+        #expect(file.parentItemIdentifier == folderID)
+        #expect(remote.readOperationCount == 2)
+    }
+
+    @Test(arguments: MovedFileScenario.allCases, [false, true])
+    func directoryListingRecoversMovedFileFromPreviousServer(
+        scenario: MovedFileScenario,
+        paginated: Bool
+    ) async throws {
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let hasUnfinishedUpload = scenario == .unfinishedUpload
+        let previous = try writeLegacyStoreWithOutdatedDAVHost(fileUploadFailed: hasUnfinishedUpload)
+        let manager = try openManager()
+        let account = Self.currentAccount
+        let remote = makeRemoteWithTeamFolder()
+        let folder = try #require(remote.rootItem?.children.first)
+        let oldPathOnCurrentServer = try #require(folder.children.first?.remotePath)
+        let destination = account.davFilesUrl + "/Moved report.txt"
+        let move = await remote.move(
+            remotePathSource: oldPathOnCurrentServer,
+            remotePathDestination: destination,
+            account: account
+        )
+        try #require(move.error == .success)
+        if scenario == .replacementAtCachedPath {
+            let replacement = MockRemoteItem(
+                identifier: "replacement-item",
+                name: Self.fileName,
+                remotePath: oldPathOnCurrentServer,
+                account: account.ncKitAccount,
+                username: account.username,
+                userId: account.id,
+                serverUrl: account.serverUrl
+            )
+            replacement.parent = folder
+            folder.children = [replacement]
+        }
+        let workingSet = try Enumerator(
+            enumeratedItemIdentifier: .workingSet,
+            account: account,
+            remoteInterface: remote,
+            dbManager: manager,
+            log: log
+        )
+        let firstSnapshot = MockEnumerationObserver(enumerator: workingSet)
+        await #expect(throws: NSFileProviderError(.cannotSynchronize)) {
+            try await firstSnapshot.enumerateItems()
+        }
+        #expect(firstSnapshot.items.isEmpty)
+        #expect(remote.readOperationCount == 0)
+        #expect(manager.itemMetadata(ocId: Self.fileId) == nil)
+
+        let pageSettings: (page: NSFileProviderPage?, index: Int, size: Int)?
+        if paginated {
+            remote.pagination = true
+            let pageSize = 2
+            let firstPage = await Enumerator.readServerUrl(
+                account.davFilesUrl,
+                pageSettings: (nil, 0, pageSize),
+                account: account,
+                remoteInterface: remote,
+                dbManager: manager,
+                depth: .targetAndDirectChildren,
+                log: log
+            )
+            try #require(firstPage.error == nil)
+            #expect(firstPage.metadatas?.map(\.ocId) == [Self.folderId])
+            let continuation = try #require(firstPage.nextPage)
+            let token = try #require(continuation.token)
+            pageSettings = (NSFileProviderPage(Data(token.utf8)), continuation.index, pageSize)
+        } else {
+            pageSettings = nil
+        }
+        let listing = await Enumerator.readServerUrl(
+            account.davFilesUrl,
+            pageSettings: pageSettings,
+            account: account,
+            remoteInterface: remote,
+            dbManager: manager,
+            depth: .targetAndDirectChildren,
+            log: log
+        )
+
+        if hasUnfinishedUpload {
+            #expect(listing.error != nil)
+            #expect(listing.metadatas == nil)
+            #expect(manager.itemMetadata(ocId: Self.fileId) == nil)
+            let saved = try #require(manager.itemMetadatas(account: previous.ncKitAccount).first { $0.ocId == Self.fileId })
+            #expect(saved.remotePath() == previous.davFilesUrl + "/" + Self.folderName + "/" + Self.fileName)
+            #expect(saved.status == Status.uploadError.rawValue)
+            #expect(saved.chunkUploadId == "pending-edit-upload")
+            #expect(saved.etag == Self.storedETag)
+            #expect(saved.downloaded)
+            #expect(saved.keepDownloaded)
+            #expect(!saved.uploaded)
+            #expect(!saved.deleted)
+            return
+        }
+
+        #expect(listing.error == nil)
+        let listedFile = try #require(listing.metadatas?.first { $0.ocId == Self.fileId })
+        #expect(listedFile.remotePath() == destination)
+        #expect(listedFile.downloaded)
+        #expect(listedFile.keepDownloaded)
+        #expect(manager.itemMetadata(ocId: Self.fileId)?.remotePath() == destination)
+
+        let nextSnapshot = MockEnumerationObserver(enumerator: workingSet)
+        try await nextSnapshot.enumerateItems()
+        let reported = try #require(nextSnapshot.items.first { $0.itemIdentifier.rawValue == Self.fileId } as? Item)
+        #expect(reported.parentItemIdentifier == .rootContainer)
+        #expect(reported.metadata.remotePath() == destination)
+    }
+
+    @Test(arguments: [false, true])
+    func listingMovedPreviousServerFolderAsTargetKeepsItsCachedRow(paginated: Bool) async throws {
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let previous = try writeLegacyStoreWithOutdatedDAVHost()
+        let manager = try openManager()
+        let account = Self.currentAccount
+        let remote = makeRemoteWithTeamFolder()
+        let folder = try #require(remote.rootItem?.children.first)
+        let destination = account.davFilesUrl + "/Renamed team folder"
+        let move = await remote.move(
+            remotePathSource: folder.remotePath,
+            remotePathDestination: destination,
+            account: account
+        )
+        try #require(move.error == .success)
+
+        let listing = await Enumerator.readServerUrl(
+            destination,
+            pageSettings: paginated ? (nil, 0, 10) : nil,
+            account: account,
+            remoteInterface: remote,
+            dbManager: manager,
+            depth: .targetAndDirectChildren,
+            log: log
+        )
+
+        #expect(listing.error != nil)
+        #expect(listing.metadatas == nil)
+        #expect(manager.itemMetadata(ocId: Self.folderId) == nil)
+        #expect(manager.itemMetadata(ocId: Self.fileId) == nil)
+        let cached = manager.itemMetadatas(account: previous.ncKitAccount)
+        let cachedFolder = try #require(cached.first { $0.ocId == Self.folderId })
+        #expect(cachedFolder.remotePath() == previous.davFilesUrl + "/" + Self.folderName)
+        #expect(cachedFolder.visitedDirectory)
+        let cachedFile = try #require(cached.first { $0.ocId == Self.fileId })
+        #expect(cachedFile.downloaded)
+        #expect(cachedFile.keepDownloaded)
+    }
+
+    @Test(arguments: DAVReadScope.allCases, [true, false])
+    func onlyDirectoryListingAtCachedPathRecoversPendingUpload(
+        scope: DAVReadScope,
+        pathMatches: Bool
+    ) async throws {
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let account = Self.currentAccount
+        let previous = try writeLegacyStoreWithOutdatedDAVHost(fileUploadFailed: true)
+        let manager = try openManager()
+        let remote = makeRemoteWithTeamFolder()
+        let folderURL = account.davFilesUrl + "/" + Self.folderName
+        let remoteFile = try #require(remote.rootItem?.children.first?.children.first)
+        if !pathMatches {
+            remoteFile.name = "Renamed report.txt"
+            remoteFile.remotePath = folderURL + "/" + remoteFile.name
+        }
+
+        let result = await Enumerator.readServerUrl(
+            scope == .item ? remoteFile.remotePath : folderURL,
+            pageSettings: scope == .paginatedDirectory ? (nil, 0, 10) : nil,
+            account: account,
+            remoteInterface: remote,
+            dbManager: manager,
+            depth: scope == .item ? .target : .targetAndDirectChildren,
+            log: log
+        )
+
+        let saved: SendableItemMetadata
+        if scope != .item, pathMatches {
+            #expect(result.error == nil)
+            let reported = try #require(result.metadatas?.first { $0.ocId == Self.fileId })
+            #expect(reported.status == Status.uploadError.rawValue)
+            #expect(reported.etag == Self.storedETag)
+            saved = try #require(manager.itemMetadata(ocId: Self.fileId))
+            #expect(saved.remotePath() == remoteFile.remotePath)
+        } else {
+            #expect(result.error != nil)
+            #expect(manager.itemMetadata(ocId: Self.fileId) == nil)
+            saved = try #require(manager.itemMetadatas(account: previous.ncKitAccount).first { $0.ocId == Self.fileId })
+            #expect(saved.remotePath() == previous.davFilesUrl + "/" + Self.folderName + "/" + Self.fileName)
+        }
+        #expect(saved.status == Status.uploadError.rawValue)
+        #expect(!saved.uploaded)
+        #expect(saved.chunkUploadId == "pending-edit-upload")
+        #expect(saved.keepDownloaded)
+        #expect(saved.etag == Self.storedETag)
+    }
+
+    @Test func targetReadOfPreviousServerItemKeepsCurrentItemAtSamePath() async throws {
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let previous = try writeLegacyStoreWithOutdatedDAVHost()
+        let manager = try openManager()
+        let remote = makeRemoteWithTeamFolder()
+        let account = Self.currentAccount
+        let folderURL = account.davFilesUrl + "/" + Self.folderName
+        let fileURL = folderURL + "/" + Self.fileName
+        let replacement = DatabaseTestSuites.makeFile(
+            ocId: "replacement-id",
+            fileName: Self.fileName,
+            serverUrl: folderURL,
+            account: account
+        )
+        // The database already contains a different live item at the requested path.
+        manager.addItemMetadata(replacement)
+        try #require(manager.itemMetadata(locatedAtRemoteUrl: fileURL)?.ocId == replacement.ocId)
+
+        let result = await Enumerator.readServerUrl(
+            fileURL,
+            account: account,
+            remoteInterface: remote,
+            dbManager: manager,
+            depth: .target,
+            log: log
+        )
+
+        #expect(result.error == .invalidData)
+        #expect(manager.itemMetadata(ocId: Self.fileId) == nil)
+        #expect(manager.itemMetadata(ocId: replacement.ocId)?.deleted == false)
+        let retained = try #require(manager.itemMetadatas(account: previous.ncKitAccount).first { $0.ocId == Self.fileId })
+        #expect(retained.downloaded && retained.keepDownloaded)
+    }
+
+    @Test(arguments: [true, false])
+    func fullListingPreservesRecoveredPendingUploadAfterServerMove(movesToRoot: Bool) async throws {
+        defer { try? FileManager.default.removeItem(at: directory) }
+        _ = try writeLegacyStoreWithOutdatedDAVHost(fileUploadFailed: true)
+        let manager = try openManager()
+        let remote = makeRemoteWithTeamFolder()
+        let account = Self.currentAccount
+        let folderURL = account.davFilesUrl + "/" + Self.folderName
+        let initialListing = await listDirectory(folderURL, manager: manager, remote: remote)
+        try #require(initialListing.error == nil)
+        try #require(manager.itemMetadata(ocId: Self.fileId)?.hasUnfinishedUpload == true)
+
+        let root = try #require(remote.rootItem)
+        let folder = try #require(root.children.first)
+        let file = try #require(folder.children.first)
+        let originalURL = file.remotePath
+        let destination = movesToRoot ? root : folder
+        if movesToRoot {
+            folder.children = []
+            root.children.append(file)
+            file.parent = root
+        } else {
+            file.name = "Renamed report.txt"
+        }
+        file.remotePath = destination.remotePath + "/" + file.name
+
+        let result = await Enumerator.readServerUrl(
+            destination.remotePath,
+            account: account,
+            remoteInterface: remote,
+            dbManager: manager,
+            depth: .targetAndDirectChildren,
+            log: log
+        )
+
+        #expect(result.error == .metadataDatabaseWriteFailed)
+        let saved = try #require(manager.itemMetadata(ocId: Self.fileId))
+        #expect(saved.remotePath() == originalURL)
+        #expect(saved.status == Status.uploadError.rawValue)
+        #expect(saved.chunkUploadId == "pending-edit-upload")
+        #expect(saved.etag == Self.storedETag)
+    }
+
+    @Test func directoryListingAndSubsequentReadsPreservePendingUpload() async throws {
+        defer { try? FileManager.default.removeItem(at: directory) }
+        _ = try writeLegacyStoreWithOutdatedDAVHost(fileUploadFailed: true)
+        let manager = try openManager()
+        let remote = makeRemoteWithTeamFolder()
+        let account = Self.currentAccount
+        let folder = try #require(remote.rootItem?.children.first)
+        let addedFile = MockRemoteItem(
+            identifier: "new-team-file",
+            name: "New file.txt",
+            remotePath: folder.remotePath + "/New file.txt",
+            account: account.ncKitAccount,
+            username: account.username,
+            userId: account.id,
+            serverUrl: account.serverUrl
+        )
+        addedFile.parent = folder
+        folder.children.append(addedFile)
+
+        let folderURL = account.davFilesUrl + "/" + Self.folderName
+        let listing = await listDirectory(folderURL, manager: manager, remote: remote)
+        #expect(listing.error == nil)
+        #expect(listing.changes?.deleted.isEmpty == true)
+        #expect(listing.changes?.updated.contains { $0.ocId == Self.fileId } == true)
+        #expect(listing.changes?.created.contains { $0.ocId == addedFile.identifier } == true)
+        let fileURL = folderURL + "/" + Self.fileName
+        let reads: [(String, EnumerateDepth)] = [
+            (folderURL, .targetAndDirectChildren),
+            (fileURL, .target)
+        ]
+        for (url, depth) in reads {
+            let result = await Enumerator.readServerUrl(
+                url,
+                account: account,
+                remoteInterface: remote,
+                dbManager: manager,
+                depth: depth,
+                log: log
+            )
+            #expect(result.error == nil)
+            let reported = try #require(result.metadatas?.first { $0.ocId == Self.fileId })
+            #expect(reported.status == Status.uploadError.rawValue)
+            #expect(reported.etag == Self.storedETag)
+        }
+        let saved = try #require(manager.itemMetadata(ocId: Self.fileId))
+        #expect(saved.status == Status.uploadError.rawValue)
+        #expect(saved.chunkUploadId == "pending-edit-upload")
+        #expect(saved.etag == Self.storedETag)
+    }
+
+    private func writeLegacyStoreWithOutdatedDAVHost(
+        fileUploadFailed: Bool = false,
+        materialised: Bool = true
+    ) throws -> Account {
+        let current = Self.currentAccount
+        let previous = Account(
+            user: current.username,
+            id: current.id,
+            serverUrl: "https://previous.example.com/cloud",
+            password: current.password
+        )
+        _ = try writeVersionOneStoreWithMaterializedItems(
+            oldAccount: previous,
+            fileUploadFailed: fileUploadFailed,
+            materialised: materialised
+        )
+        // Recreate the state left by an older extension after a server URL change.
+        // The domain settings use the current URL, but the v1 database still has the previous URL.
+        savePreviouslyConfiguredAccount(current)
+        return previous
+    }
+
     private func writeVersionOneStoreWithMaterializedItems(
         oldAccount: Account = Self.oldAccount,
-        additionalMetadata: [SendableItemMetadata] = []
+        additionalMetadata: [SendableItemMetadata] = [],
+        fileUploadFailed: Bool = false,
+        materialised: Bool = true
     ) throws -> String {
         savePreviouslyConfiguredAccount(oldAccount)
         let oldParent = oldAccount.davFilesUrl + "/" + Self.folderName
@@ -773,7 +1286,7 @@ struct DAVPathPersistenceTests {
             account: oldAccount
         )
         folder.directory = true
-        folder.visitedDirectory = true
+        folder.visitedDirectory = materialised
         folder.uploaded = true
         folder.etag = Self.storedETag
         var file = DatabaseTestSuites.makeFile(
@@ -782,10 +1295,15 @@ struct DAVPathPersistenceTests {
             serverUrl: oldParent,
             account: oldAccount
         )
-        file.downloaded = true
+        file.downloaded = materialised
         file.uploaded = true
-        file.keepDownloaded = true
+        file.keepDownloaded = materialised
         file.etag = Self.storedETag
+        if fileUploadFailed {
+            file.uploaded = false
+            file.status = Status.uploadError.rawValue
+            file.chunkUploadId = "pending-edit-upload"
+        }
         return try FilesDatabaseManager.writeVersionOneStoreForTesting(
             at: directory.appendingPathComponent(domain.rawValue).appendingPathExtension(DatabaseSchema.fileExtension),
             metadata: [folder, file] + additionalMetadata,
@@ -846,6 +1364,21 @@ struct DAVPathPersistenceTests {
         folder.children = [file]
         file.parent = folder
         return MockRemoteInterface(account: account, rootItem: root)
+    }
+
+    private func listDirectory(
+        _ url: String,
+        manager: FilesDatabaseManager,
+        remote: MockRemoteInterface
+    ) async -> RemoteReadResult {
+        await Enumerator.readServerUrl(
+            url,
+            account: Self.currentAccount,
+            remoteInterface: remote,
+            dbManager: manager,
+            depth: .targetAndDirectChildren,
+            log: log
+        )
     }
 
     private func enumerateChanges(
