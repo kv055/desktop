@@ -1098,9 +1098,8 @@ public final class FilesDatabaseManager: Sendable {
         // The local flags carried over from the old row were committed durably when set.
         try write(durability: .relaxed) { db in
             if let existing = try itemMetadata(ocId: metadata.ocId, in: db) {
-                // A listing describes the server copy while the local edit is still pending.
-                if !existing.deleted, existing.hasUnfinishedUpload {
-                    toWrite = existing.metadata
+                if let pendingUpload = try pendingUploadMetadataMatchingListingItem(existing, listed: metadata) {
+                    toWrite = pendingUpload
                     return
                 }
 

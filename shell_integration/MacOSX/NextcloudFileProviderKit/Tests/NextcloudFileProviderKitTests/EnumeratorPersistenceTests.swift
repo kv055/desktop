@@ -136,6 +136,62 @@ struct EnumeratorPersistenceTests {
         #expect(manager.itemMetadata(ocId: file.identifier)?.etag == "file-v2")
     }
 
+    @Test(arguments: [false, true])
+    func paginatedListingOnlyReportsPendingUploadAtItsCachedPath(movedOnServer: Bool) async throws {
+        var pending = try #require(manager.itemMetadata(ocId: file.identifier))
+        pending.status = Status.uploadError.rawValue
+        pending.uploaded = false
+        pending.etag = "local-edit"
+        pending.chunkUploadId = "pending-edit-upload"
+        pending.keepDownloaded = true
+        manager.addItemMetadata(pending)
+        remote.pagination = true
+
+        let listedFolderURL = movedOnServer ? account.davFilesUrl + "/destination" : folder.remotePath
+        if movedOnServer {
+            let created = await remote.createFolder(remotePath: listedFolderURL, account: account)
+            try #require(created.error == .success)
+            let moved = await remote.move(
+                remotePathSource: file.remotePath,
+                remotePathDestination: listedFolderURL + "/" + file.name,
+                account: account
+            )
+            try #require(moved.error == .success)
+            #expect(file.identifier == pending.ocId)
+        }
+
+        let result = await Enumerator.readServerUrl(
+            listedFolderURL,
+            pageSettings: (nil, 0, 10),
+            account: account,
+            remoteInterface: remote,
+            dbManager: manager,
+            depth: .targetAndDirectChildren,
+            log: FileProviderLogMock()
+        )
+
+        #expect(remote.readOperationCount == 1)
+        if movedOnServer {
+            #expect(result.error == .invalidData)
+            #expect(result.error?.fileProviderError?.code == .cannotSynchronize)
+            #expect(result.metadatas == nil)
+        } else {
+            #expect(result.error == nil)
+            let reported = try #require(result.metadatas?.first)
+            #expect(reported.ocId == pending.ocId)
+            #expect(reported.remotePath() == pending.remotePath())
+            #expect(reported.hasUnfinishedUpload)
+            #expect(reported.etag == pending.etag)
+        }
+
+        let saved = try #require(manager.itemMetadata(ocId: pending.ocId))
+        #expect(saved.remotePath() == pending.remotePath())
+        #expect(saved.hasUnfinishedUpload)
+        #expect(saved.etag == pending.etag)
+        #expect(saved.chunkUploadId == pending.chunkUploadId)
+        #expect(saved.keepDownloaded)
+    }
+
     @Test func directoryListingPreservesChildrenStoredUnderTheDAVResponseURL() async throws {
         let account = Account(
             user: "login",
