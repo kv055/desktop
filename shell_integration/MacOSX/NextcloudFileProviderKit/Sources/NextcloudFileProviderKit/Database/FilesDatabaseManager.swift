@@ -82,7 +82,8 @@ public final class FilesDatabaseManager: Sendable {
     /// The open database: a pool on the domain's file, or an in-memory queue when no directory is available.
     let writer: any DatabaseWriter
 
-    /// Random identity of the open database file, minted on its first open. It is part of every sync anchor, so the anchors of a replaced file expire.
+    /// Identity of the database and its current account binding. Replacing the database or
+    /// binding it to a different DAV account expires the previous sync anchors.
     let storeIdentity: String
 
     /// Location of the database file, `nil` when the database lives in memory.
@@ -285,6 +286,11 @@ public final class FilesDatabaseManager: Sendable {
 
         var result: T?
         try db.inTransaction {
+            // Rebinding changes the identity in the same transaction as the item rows.
+            // A DAV response queued by the previous manager must not overwrite those rows.
+            guard try StoreIdentityRecord.fetchOne(db)?.identity == storeIdentity else {
+                throw NSFileProviderError(.cannotSynchronize)
+            }
             result = try body(db)
             return .commit
         }

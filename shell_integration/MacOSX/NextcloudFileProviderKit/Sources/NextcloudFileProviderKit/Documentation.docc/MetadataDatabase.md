@@ -55,7 +55,7 @@ The store version and the store identity are part of every sync anchor, so after
 
 Every database file carries a random identity in its `storeIdentity` table, minted the first time the file is opened and read once per `FilesDatabaseManager`. Together with the store version it is part of every sync anchor the enumerators hand to the framework. An anchor from another file, whether that file was set aside as corrupt, removed after a downgrade or deleted by hand, is answered with `syncAnchorExpired`, so the framework re-enumerates the container instead of taking an empty store for a store without changes. Nothing is reimported, because the item identifiers are the server's `ocId` values and survive the replacement.
 
-When the domain opens with different account details, the database can update rows it can match to the previous account. It changes their account fields, assigns a new store identity, and discards pending change batches saved for the previous account in one transaction. The rows keep their item IDs and local state.
+When the domain opens with different account details, the database can update rows it can match to the previous account. It changes their account fields, assigns a new store identity, and discards pending change batches saved for the previous account in one transaction. The rows keep their item IDs and local state. Each write checks that its database manager still has the current store identity, so a delayed response from the previous account cannot overwrite the rebound rows.
 
 ## Recovering item metadata after a server URL change
 

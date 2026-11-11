@@ -103,6 +103,42 @@ struct LegacyDAVAccountTests {
         #expect(saved.lockToken == (change == .unchanged ? file.lockToken : nil))
     }
 
+    @Test(arguments: [AccountChange.serverURL, .backendUserID])
+    func previousManagerCannotSaveADAVResponseAfterRebinding(change: AccountChange) async throws {
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let previous = Self.previousAccount
+        let current = change.applying(to: previous)
+        var file = DatabaseTestSuites.makeFile(
+            ocId: "materialized-file",
+            fileName: "Report.txt",
+            account: previous
+        )
+        file.downloaded = true
+        file.keepDownloaded = true
+        let previousManager = try openDatabase(account: previous)
+        previousManager.addItemMetadata(file)
+        try #require(previousManager.itemMetadata(ocId: file.ocId) != nil)
+
+        let currentManager = try openDatabase(account: current)
+        var delayedResponse = file
+        delayedResponse.downloaded = false
+        delayedResponse.keepDownloaded = false
+        await #expect(throws: NSFileProviderError(.cannotSynchronize)) {
+            _ = try await previousManager.addItemMetadataFromRemoteRead(
+                delayedResponse,
+                requestedURL: delayedResponse.remotePath(),
+                wasAwaitingDirectoryListing: false,
+                isCancelled: { false }
+            )
+        }
+
+        previousManager.addItemMetadata(delayedResponse)
+        let retained = try #require(currentManager.itemMetadata(ocId: file.ocId))
+        #expect(retained.remotePath() == current.davFilesUrl + "/" + file.fileName)
+        #expect(retained.downloaded)
+        #expect(retained.keepDownloaded)
+    }
+
     private func openDatabase(account: Account) throws -> FilesDatabaseManager {
         try FilesDatabaseManager(
             account: account,
