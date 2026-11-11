@@ -189,8 +189,11 @@ struct BlockSyncTests {
         #expect((error as? NSFileProviderError)?.code != .serverUnreachable)
     }
 
-    @Test(arguments: [false, true])
-    func itemFromPreviousServerDoesNotSendPROPFINDWhileSyncIsBlocked(usesKeepDownloadedAction: Bool) async throws {
+    @Test(arguments: [false, true], [false, true])
+    func blockedSyncPreventsDAVReadsForItemLookup(
+        usesKeepDownloadedAction: Bool,
+        usesPreviousServerURL: Bool
+    ) async throws {
         let host = "\(UUID().uuidString.lowercased()).example.invalid"
         let previousHost = "old-\(host)"
         let account = Account(
@@ -244,11 +247,20 @@ struct BlockSyncTests {
         let fileProviderExtension = FileProviderExtension(domain: domain, ncKit: remote)
         defer { fileProviderExtension.invalidate() }
 
+        let metadataAccount = usesPreviousServerURL ? previous : account
+        let parentName = "Team folder"
         let metadata = DatabaseTestSuites.makeFile(
-            ocId: "old-host-item",
+            ocId: "cached-item",
             fileName: "Report.txt",
+            serverUrl: metadataAccount.davFilesUrl + "/" + parentName,
+            account: metadataAccount
+        )
+        var previousParent = DatabaseTestSuites.makeFile(
+            ocId: "previous-parent",
+            fileName: parentName,
             account: previous
         )
+        previousParent.directory = true
         let directory = FileManager.default.temporaryDirectory
             .appendingPathComponent(fileProviderExtension.domain.identifier.rawValue, isDirectory: true)
         try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
@@ -256,7 +268,10 @@ struct BlockSyncTests {
         let store = directory
             .appendingPathComponent(fileProviderExtension.domain.identifier.rawValue)
             .appendingPathExtension(DatabaseSchema.fileExtension)
-        _ = try FilesDatabaseManager.writeVersionOneStoreForTesting(at: store, metadata: [metadata])
+        _ = try FilesDatabaseManager.writeVersionOneStoreForTesting(
+            at: store,
+            metadata: usesPreviousServerURL ? [metadata] : [metadata, previousParent]
+        )
         let manager = try FilesDatabaseManager(
             account: account,
             databaseDirectory: directory,
@@ -288,8 +303,17 @@ struct BlockSyncTests {
 
         #expect((error as? NSFileProviderError)?.code == .serverUnreachable)
         #expect(requestMethods.withLock { $0.isEmpty })
-        #expect(manager.itemMetadata(ocId: metadata.ocId) == nil)
-        #expect(manager.itemMetadatas(account: previous.ncKitAccount).map(\.ocId) == [metadata.ocId])
+        if usesPreviousServerURL {
+            #expect(manager.itemMetadata(ocId: metadata.ocId) == nil)
+            #expect(manager.itemMetadatas(account: previous.ncKitAccount).map(\.ocId) == [metadata.ocId])
+        } else {
+            #expect(manager.itemMetadata(ocId: metadata.ocId)?.remotePath() == metadata.remotePath())
+            #expect(manager.directoryMetadata(ocId: previousParent.ocId) == nil)
+            #expect(manager.itemMetadata(locatedAtRemoteUrl: metadata.serverUrl) == nil)
+            let retainedParent = try #require(manager.itemMetadatas(account: previous.ncKitAccount).first)
+            #expect(retainedParent.ocId == previousParent.ocId)
+            #expect(retainedParent.remotePath() == previousParent.remotePath())
+        }
     }
 
     ///

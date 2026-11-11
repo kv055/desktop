@@ -36,6 +36,7 @@ The extension refuses the following requests when they need the server.
 | Request | Why it needs the server |
 | --- | --- |
 | ``FileProviderExtension/enumerator(for:request:)`` | remote changes arriving |
+| Item lookup, Keep Downloaded, or eviction when the parent is missing from the database | Look up the parent over WebDAV |
 | ``FileProviderExtension/fetchContents(for:version:request:completionHandler:)`` | downloads |
 | ``FileProviderExtension/createItem(basedOn:fields:contents:options:request:completionHandler:)`` | uploads |
 | ``FileProviderExtension/modifyItem(_:baseVersion:changedFields:contents:options:request:completionHandler:)`` | uploads |

@@ -505,7 +505,8 @@ public final class Item: NSObject, NSFileProviderItem, Sendable {
 
     /// Get the item for a File Provider request and report lookup errors to the caller.
     /// Items from the previous server wait for a directory listing to confirm their IDs.
-    /// An item waiting for a directory listing returns `serverUnreachable` while synchronization is paused.
+    /// Set `allowsRemoteLookup` to false when synchronization is paused so a current
+    /// item with an uncached parent returns `serverUnreachable` before a DAV read.
     static func lookupResolvingParent(
         identifier: NSFileProviderItemIdentifier,
         account: Account,
@@ -565,11 +566,10 @@ public final class Item: NSObject, NSFileProviderItem, Sendable {
 
         try checkCancellation()
 
-        let remoteSupportsTrash = await remoteInterface.supportsTrash(account: account)
-        try checkCancellation()
-
         let parentItemIdentifier: NSFileProviderItemIdentifier? = if metadata.isTrashed {
             .trashContainer
+        } else if !allowsRemoteLookup {
+            dbManager.parentItemIdentifierFromMetadata(metadata)
         } else {
             await dbManager.parentItemIdentifierWithRemoteFallback(
                 fromMetadata: metadata,
@@ -583,8 +583,11 @@ public final class Item: NSObject, NSFileProviderItem, Sendable {
         try checkCancellation()
         // A failed parent read says nothing about whether the cached child was removed.
         guard let parentItemIdentifier else {
-            throw unresolvedParentError
+            throw allowsRemoteLookup ? unresolvedParentError : NSFileProviderError(.serverUnreachable)
         }
+
+        let remoteSupportsTrash = await remoteInterface.supportsTrash(account: account)
+        try checkCancellation()
 
         // Display File Actions
 
