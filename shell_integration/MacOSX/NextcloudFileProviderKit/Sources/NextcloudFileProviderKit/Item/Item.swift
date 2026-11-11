@@ -604,6 +604,21 @@ public final class Item: NSObject, NSFileProviderItem, Sendable {
         )
     }
 
+    /// Use a current folder for a create or move. Retry if a directory listing still needs to confirm it.
+    static func destinationFolderMetadata(
+        for identifier: NSFileProviderItemIdentifier,
+        account: Account,
+        dbManager: FilesDatabaseManager
+    ) throws -> (metadata: SendableItemMetadata, pathFromFilesRoot: String) {
+        guard let metadata = dbManager.directoryMetadata(ocId: identifier.rawValue),
+              !metadata.deleted,
+              let pathFromFilesRoot = account.filesRootRelativePath(for: metadata.remotePath()),
+              account.ownsDAVReadURL(metadata.remotePath(), sourceMetadata: metadata)
+        else { throw NSFileProviderError(.cannotSynchronize) }
+
+        return (metadata, pathFromFilesRoot)
+    }
+
     public func localUrlForContents(domain: NSFileProviderDomain) async -> URL? {
         guard isDownloaded else {
             logger.error("Unable to get local URL for item contents. Item is not materialised.", [.name: filename])
