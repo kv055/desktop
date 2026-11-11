@@ -767,11 +767,11 @@ void SyncEngine::startSync()
             _discoveryPhase.get()
         );
     }
-    
+
+    connect(discoveryJob, &ProcessDirectoryJob::rootFileIdReceived, this, &SyncEngine::slotRootFileIdReceived);
     _discoveryPhase->startJob(discoveryJob);
     connect(discoveryJob, &ProcessDirectoryJob::etag, this, &SyncEngine::slotRootEtagReceived);
     connect(discoveryJob, &ProcessDirectoryJob::updatedRootFolderQuota, account().data(), &Account::rootFolderQuotaChanged);
-    connect(discoveryJob, &ProcessDirectoryJob::rootFileIdReceived, this, &SyncEngine::slotRootFileIdReceived);
     connect(_discoveryPhase.get(), &DiscoveryPhase::addErrorToGui, this, &SyncEngine::addErrorToGui);
 }
 
@@ -803,14 +803,14 @@ void SyncEngine::slotRootEtagReceived(const QByteArray &e, const QDateTime &time
     }
 }
 
-void SyncEngine::slotRootFileIdReceived(const qint64 fileId)
+void SyncEngine::slotRootFileIdReceived(qint64 fileId, const QByteArray &instanceId)
 {
-    if (_rootFileIdReceived) {
+    if (fileId == _rootFileId && instanceId == _rootFileIdInstanceId && instanceId.isNull() == _rootFileIdInstanceId.isNull()) {
         return;
     }
     _rootFileId = fileId;
-    _rootFileIdReceived = true;
-    Q_EMIT rootFileIdReceived(fileId);
+    _rootFileIdInstanceId = instanceId;
+    Q_EMIT rootFileIdReceived(fileId, instanceId);
 }
 
 void SyncEngine::slotNewItem(const SyncFileItemPtr &item)

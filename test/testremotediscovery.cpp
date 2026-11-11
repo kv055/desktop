@@ -14,6 +14,7 @@
 #include <localdiscoverytracker.h>
 
 using namespace OCC;
+using namespace Qt::StringLiterals;
 
 struct FakeBrokenXmlPropfindReply : FakePropfindReply {
     FakeBrokenXmlPropfindReply(FileInfo &remoteRootFileInfo, QNetworkAccessManager::Operation op,
@@ -236,22 +237,56 @@ private Q_SLOTS:
 
     void testRootFileIdReceived()
     {
-        // disable FakeFolder's initial sync run to allow for spying on the `rootFileIdReceived` signal
-        FakeFolder fakeFolder{ FileInfo::A12_B12_C12_S12(), {}, {}, false };
+        const auto originalDavIdProperty = "<oc:id>603493314oc1x2y3z4w</oc:id>"_ba;
+        const auto originalNumericIdProperty = "<oc:fileid>603493314</oc:fileid>"_ba;
+        auto davIdProperty = "<oc:id>603493314123xyz</oc:id>"_ba;
+        auto numericIdProperty = originalNumericIdProperty;
 
+        auto remoteState = FileInfo::A12_B12_C12_S12();
+        remoteState.fileId = "603493314oc1x2y3z4w"_ba;
+        FakeFolder fakeFolder{remoteState, {}, {}, false};
+        fakeFolder.setServerOverride([&](QNetworkAccessManager::Operation op, const QNetworkRequest &request, QIODevice *) -> QNetworkReply * {
+            if (request.attribute(QNetworkRequest::CustomVerbAttribute).toString() != u"PROPFIND"_s || !getFilePathFromUrl(request.url()).isEmpty()) {
+                return nullptr;
+            }
+            const auto reply = new FakePropfindReply(fakeFolder.remoteModifier(), op, request, nullptr);
+            reply->payload.replace(originalDavIdProperty, davIdProperty);
+            reply->payload.replace(originalNumericIdProperty, numericIdProperty);
+            return reply;
+        });
         QSignalSpy rootFileIdSpy(&fakeFolder.syncEngine(), &SyncEngine::rootFileIdReceived);
-        QVERIFY(fakeFolder.syncOnce());
 
-        // root file id signal should only be emitted once
-        QCOMPARE(rootFileIdSpy.size(), 1);
-        const auto expectedRootFileId = fakeFolder.currentRemoteState().numericFileId();
-        const auto receivedRootFileId = QByteArray::number(rootFileIdSpy.takeFirst().at(0).toLongLong(), 10);
-        QCOMPARE(receivedRootFileId, expectedRootFileId);
+        const auto verifyRootIdentity = [&](qint64 expectedId, const QByteArray &expectedInstanceId) {
+            QCOMPARE(rootFileIdSpy.size(), 1);
+            const auto arguments = rootFileIdSpy.takeFirst();
+            QCOMPARE(arguments.at(0).toLongLong(), expectedId);
+            const auto instanceId = arguments.at(1).toByteArray();
+            QCOMPARE(instanceId, expectedInstanceId);
+            QCOMPARE(instanceId.isNull(), expectedInstanceId.isNull());
+        };
 
-        // another sync should not emit the root file id signal again as it's already known
-        rootFileIdSpy.clear();
         QVERIFY(fakeFolder.syncOnce());
-        QCOMPARE(rootFileIdSpy.size(), 0);
+        verifyRootIdentity(603493314, "123xyz"_ba);
+
+        QVERIFY(fakeFolder.syncOnce());
+        QVERIFY(rootFileIdSpy.isEmpty());
+
+        davIdProperty = "<oc:id>603493314</oc:id>"_ba;
+        QVERIFY(fakeFolder.syncOnce());
+        verifyRootIdentity(603493314, ""_ba);
+
+        davIdProperty = "<oc:id>603493315123xyz</oc:id>"_ba;
+        QVERIFY(fakeFolder.syncOnce());
+        verifyRootIdentity(603493314, {});
+
+        numericIdProperty.clear();
+        QVERIFY(fakeFolder.syncOnce());
+        verifyRootIdentity(0, {});
+
+        numericIdProperty = originalNumericIdProperty;
+        davIdProperty = "<oc:id>603493314123456</oc:id>"_ba;
+        QVERIFY(fakeFolder.syncOnce());
+        verifyRootIdentity(603493314, "123456"_ba);
     }
 
     // Regression: processEvents() inside LsColJob::finished() must not run before reply()

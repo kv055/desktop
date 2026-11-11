@@ -157,7 +157,8 @@ public Q_SLOTS:
 Q_SIGNALS:
     // During update, before reconcile
     void rootEtag(const QByteArray &, const QDateTime &);
-    void rootFileIdReceived(qint64 fileId);
+    // A null instance ID means the DAV suffix could not be determined.
+    void rootFileIdReceived(qint64 fileId, const QByteArray &instanceId);
 
     // after the above signals. with the items that actually need propagating
     void aboutToPropagate(OCC::SyncFileItemVector &);
@@ -200,7 +201,7 @@ Q_SIGNALS:
 private Q_SLOTS:
     void slotFolderDiscovered(bool local, const QString &folder);
     void slotRootEtagReceived(const QByteArray &, const QDateTime &time);
-    void slotRootFileIdReceived(qint64 fileId);
+    void slotRootFileIdReceived(qint64 fileId, const QByteArray &instanceId);
 
     /** When the discovery phase discovers an item */
     void slotItemDiscovered(const OCC::SyncFileItemPtr &item);
@@ -329,8 +330,8 @@ private:
     QString _localPath;
     QString _remotePath;
     QByteArray _remoteRootEtag;
-    bool _rootFileIdReceived = false;
     qint64 _rootFileId = 0;
+    QByteArray _rootFileIdInstanceId;
     SyncJournalDb *_journal;
     std::unique_ptr<DiscoveryPhase> _discoveryPhase;
     QSharedPointer<OwncloudPropagator> _propagator;
