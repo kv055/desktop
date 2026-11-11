@@ -63,7 +63,7 @@ An older extension could save `https://new.example.com` in the domain settings a
 
 Ordinary directory listings on the current server can recover old rows with the same login and backend user ID. A listed item must match the cached `ocId` and type. A listing of the new parent can recover a moved item while keeping its ID, download flag, and "Always keep downloaded" setting. An unfinished upload can be recovered at its original path.
 
-Finder retries the working-set snapshot while a downloaded file or visited folder is still awaiting a directory listing. A direct request for an unresolved item also asks Finder to retry until a directory listing recovers it. Working-set change scans leave unresolved rows in the database and can recover them when they list a folder that contains them.
+A working-set snapshot includes an unresolved cached item when its original parent is known and its name is available there. Otherwise Finder retries the snapshot. A direct request for an unresolved item also asks Finder to retry until a directory listing recovers it. Working-set change scans leave unresolved rows in the database and can recover them when they list a folder that contains them.
 
 ## Import from Realm
 

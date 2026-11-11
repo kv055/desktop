@@ -91,6 +91,8 @@ public final class FilesDatabaseManager: Sendable {
 
     /// Downloads of this domain which the system has not yet reported as materialized, kept here because one process can host several domains and each has its own manager.
     let pendingMaterializations = PendingMaterializationRegistry()
+    /// Keep the original folder IDs available for later working-set pages after those rows are rebound.
+    let recoveredPreviousServerDirectoryIDs = OSAllocatedUnfairLock(initialState: [PreviousServerDirectoryAddress: Set<String>]())
 
     ///
     /// Open the domain's database, creating, importing or migrating it as needed.

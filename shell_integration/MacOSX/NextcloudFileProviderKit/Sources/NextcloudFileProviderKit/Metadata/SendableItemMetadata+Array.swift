@@ -1,13 +1,20 @@
 //  SPDX-FileCopyrightText: 2024 Nextcloud GmbH and Nextcloud contributors
 //  SPDX-License-Identifier: LGPL-3.0-or-later
 
+@preconcurrency import FileProvider
 import Foundation
 
 extension [SendableItemMetadata] {
     ///
     /// Concurrently compact chunks of an array of ``SendableItemMetadata`` to an array of ``Item``.
     ///
-    func toFileProviderItems(account: Account, remoteInterface: RemoteInterface, dbManager: FilesDatabaseManager, log: any FileProviderLogging) async throws -> [Item] {
+    func toFileProviderItems(
+        account: Account,
+        remoteInterface: RemoteInterface,
+        dbManager: FilesDatabaseManager,
+        unverifiedItemParentIdentifiers: [String: NSFileProviderItemIdentifier] = [:],
+        log: any FileProviderLogging
+    ) async throws -> [Item] {
         let logger = FileProviderLogger(category: "toFileProviderItems", log: log)
         let remoteSupportsTrash = await remoteInterface.supportsTrash(account: account)
         let allFilters = await Item.getContextMenuItemTypeFilters(account: account, remoteInterface: remoteInterface)
@@ -26,12 +33,14 @@ extension [SendableItemMetadata] {
                 return nil
             }
 
-            guard let parentItemIdentifier = dbManager.parentItemIdentifierFromMetadata(itemMetadata) else {
+            let cachedParent = unverifiedItemParentIdentifiers[itemMetadata.ocId]
+            guard let parentItemIdentifier = cachedParent ?? dbManager.parentItemIdentifierFromMetadata(itemMetadata) else {
                 logger.error("Could not get valid parentItemIdentifier for item by ocId.", [.item: itemMetadata.ocId, .name: itemMetadata.fileName])
                 throw FilesDatabaseManager.parentMetadataNotFoundError(for: itemMetadata)
             }
 
-            let displayFileActions = Item.typeHasApplicableContextMenuItems(filters: allFilters, candidate: itemMetadata.contentType)
+            let displayFileActions = cachedParent == nil
+                && Item.typeHasApplicableContextMenuItems(filters: allFilters, candidate: itemMetadata.contentType)
 
             let item = Item(
                 metadata: itemMetadata,

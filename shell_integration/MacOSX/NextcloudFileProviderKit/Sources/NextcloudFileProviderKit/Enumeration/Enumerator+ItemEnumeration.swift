@@ -23,14 +23,14 @@ extension Enumerator {
         // Sort by a stable key (ocId) so the offset cursor stays consistent across the paginated
         // re-invocations the framework drives; the read itself is non-destructive, so re-reading and
         // slicing on each page needs no cross-call buffer.
-        guard let items = dbManager.itemMetadataForWorkingSetSnapshot() else {
+        guard let snapshot = dbManager.itemMetadataForWorkingSetSnapshot() else {
             // Finder may treat an item omitted from an incomplete snapshot as gone.
             logger.error("Could not read a complete working set. Finishing the enumeration with an error.", [.account: account.ncKitAccount])
             observer.finishEnumeratingWithError(NSFileProviderError(.cannotSynchronize))
             return
         }
 
-        let materialisedItems = items
+        let materialisedItems = snapshot.items
             .filter { !$0.deleted }
             .sorted { $0.ocId < $1.ocId }
 
@@ -49,7 +49,8 @@ extension Enumerator {
         completeEnumerationObserver(
             observer,
             nextPage: nextPage,
-            itemMetadatas: pageItems
+            itemMetadatas: pageItems,
+            unverifiedItemParentIdentifiers: snapshot.unverifiedParentIDs
         )
     }
 

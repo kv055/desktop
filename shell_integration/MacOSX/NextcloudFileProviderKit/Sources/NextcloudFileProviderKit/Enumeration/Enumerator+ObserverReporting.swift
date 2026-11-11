@@ -21,6 +21,7 @@ extension Enumerator {
         _ observer: NSFileProviderEnumerationObserver,
         nextPage: NSFileProviderPage?,
         itemMetadatas: [SendableItemMetadata],
+        unverifiedItemParentIdentifiers: [String: NSFileProviderItemIdentifier] = [:],
         handleInvalidParent: Bool = true
     ) {
         Task {
@@ -32,7 +33,11 @@ extension Enumerator {
             )
             do {
                 let items = try await itemMetadatas.toFileProviderItems(
-                    account: account, remoteInterface: remoteInterface, dbManager: dbManager, log: self.logger.log
+                    account: account,
+                    remoteInterface: remoteInterface,
+                    dbManager: dbManager,
+                    unverifiedItemParentIdentifiers: unverifiedItemParentIdentifiers,
+                    log: self.logger.log
                 )
                 signposter.endInterval("ToFileProviderItems", toItemsState)
 
@@ -67,6 +72,7 @@ extension Enumerator {
                         observer,
                         nextPage: nextPage,
                         itemMetadatas: [metadata] + itemMetadatas,
+                        unverifiedItemParentIdentifiers: unverifiedItemParentIdentifiers,
                         handleInvalidParent: false
                     )
                 } catch {

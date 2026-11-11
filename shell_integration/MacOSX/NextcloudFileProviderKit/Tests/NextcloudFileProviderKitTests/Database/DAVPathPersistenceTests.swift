@@ -262,11 +262,11 @@ struct DAVPathPersistenceTests {
             log: log
         )
         let observer = MockEnumerationObserver(enumerator: enumerator)
-        await #expect(throws: NSFileProviderError(.cannotSynchronize)) {
-            try await observer.enumerateItems()
-        }
-        #expect(observer.items.isEmpty)
-        #expect(remote.readOperationCount == 0)
+        try await observer.enumerateItems()
+        let reported = try #require(observer.items.first as? Item)
+        #expect(reported.itemIdentifier.rawValue == pending.ocId)
+        #expect(reported.parentItemIdentifier == .rootContainer)
+        #expect(reported.metadata.chunkUploadId == pending.chunkUploadId)
 
         var listedFile = DatabaseTestSuites.makeFile(
             ocId: pending.ocId,
@@ -968,11 +968,12 @@ struct DAVPathPersistenceTests {
             log: log
         )
         let firstSnapshot = MockEnumerationObserver(enumerator: workingSet)
-        await #expect(throws: NSFileProviderError(.cannotSynchronize)) {
-            try await firstSnapshot.enumerateItems()
-        }
-        #expect(firstSnapshot.items.isEmpty)
+        try await firstSnapshot.enumerateItems()
         #expect(remote.readOperationCount == 0)
+        let retained = try #require(firstSnapshot.items.first { $0.itemIdentifier.rawValue == Self.fileId } as? Item)
+        #expect(retained.parentItemIdentifier.rawValue == Self.folderId)
+        #expect(retained.metadata.downloaded)
+        #expect(retained.metadata.keepDownloaded)
         #expect(manager.itemMetadata(ocId: Self.fileId) == nil)
 
         let pageSettings: (page: NSFileProviderPage?, index: Int, size: Int)?
@@ -1011,7 +1012,7 @@ struct DAVPathPersistenceTests {
             #expect(listing.metadatas == nil)
             #expect(manager.itemMetadata(ocId: Self.fileId) == nil)
             let saved = try #require(manager.itemMetadatas(account: previous.ncKitAccount).first { $0.ocId == Self.fileId })
-            #expect(saved.remotePath() == previous.davFilesUrl + "/" + Self.folderName + "/" + Self.fileName)
+            #expect(saved.remotePath() == retained.metadata.remotePath())
             #expect(saved.status == Status.uploadError.rawValue)
             #expect(saved.chunkUploadId == "pending-edit-upload")
             #expect(saved.etag == Self.storedETag)
@@ -1073,6 +1074,88 @@ struct DAVPathPersistenceTests {
         let cachedFile = try #require(cached.first { $0.ocId == Self.fileId })
         #expect(cachedFile.downloaded)
         #expect(cachedFile.keepDownloaded)
+    }
+
+    @Test(arguments: [false, true])
+    func workingSetKeepsOriginalWhenCachedPathNamesAnotherItem(fileUploadFailed: Bool) async throws {
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let previous = try writeLegacyStoreWithOutdatedDAVHost(fileUploadFailed: fileUploadFailed)
+        let manager = try openManager()
+        let account = Self.currentAccount
+        let seeded = try #require(manager.itemMetadatas(account: previous.ncKitAccount).first { $0.ocId == Self.fileId })
+        var healthy = DatabaseTestSuites.makeFile(ocId: "current-file", fileName: "Current.txt", account: account)
+        healthy.downloaded = true
+        healthy.uploaded = true
+        manager.addItemMetadata(healthy)
+
+        let remote = makeRemoteWithTeamFolder()
+        let root = try #require(remote.rootItem)
+        let replacement = try #require(root.children.first?.children.first)
+        replacement.identifier = "replacement-item"
+        let currentFile = MockRemoteItem(
+            identifier: healthy.ocId,
+            name: healthy.fileName,
+            remotePath: healthy.remotePath(),
+            account: account.ncKitAccount,
+            username: account.username,
+            userId: account.id,
+            serverUrl: account.serverUrl
+        )
+        currentFile.parent = root
+        root.children.append(currentFile)
+        let enumerator = try Enumerator(
+            enumeratedItemIdentifier: .workingSet,
+            account: account,
+            remoteInterface: remote,
+            dbManager: manager,
+            log: log
+        )
+        let observer = MockEnumerationObserver(enumerator: enumerator)
+
+        try await observer.enumerateItems()
+
+        #expect(observer.items.contains { $0.itemIdentifier.rawValue == healthy.ocId })
+        #expect(!observer.items.contains { $0.itemIdentifier.rawValue == replacement.identifier })
+        let retained = try #require(observer.items.first { $0.itemIdentifier.rawValue == Self.fileId } as? Item)
+        #expect(retained.parentItemIdentifier.rawValue == Self.folderId)
+        #expect(retained.metadata.downloaded)
+        #expect(retained.metadata.keepDownloaded)
+        #expect(manager.itemMetadata(ocId: Self.fileId) == nil)
+        let saved = try #require(manager.itemMetadatas(account: previous.ncKitAccount).first { $0.ocId == Self.fileId })
+        #expect(saved.status == (fileUploadFailed ? Status.uploadError.rawValue : Status.normal.rawValue))
+        #expect(saved.chunkUploadId == seeded.chunkUploadId)
+        #expect(!saved.deleted)
+
+        #expect(remote.readOperationCount == 0)
+
+        // Listing Files rebinds the old parent. A different enumerator must still know its ID.
+        let rootListing = await listDirectory(account.davFilesUrl, manager: manager, remote: remote)
+        try #require(rootListing.error == nil)
+        try #require(manager.itemMetadata(ocId: Self.folderId) != nil)
+        let newEnumerator = try Enumerator(
+            enumeratedItemIdentifier: .workingSet,
+            account: account,
+            remoteInterface: remote,
+            dbManager: manager,
+            log: log
+        )
+        let nextSnapshot = MockEnumerationObserver(enumerator: newEnumerator)
+        try await nextSnapshot.enumerateItems()
+        let original = try #require(nextSnapshot.items.first { $0.itemIdentifier.rawValue == Self.fileId })
+        #expect(original.parentItemIdentifier.rawValue == Self.folderId)
+        #expect(nextSnapshot.items.contains { $0.itemIdentifier.rawValue == healthy.ocId })
+        #expect(remote.readOperationCount == 1)
+
+        // Browsing can discover the replacement independently. A snapshot cannot publish both IDs
+        // under the same name and parent, so Finder must retry while the original is unresolved.
+        manager.addItemMetadata(replacement.toItemMetadata(account: account))
+        try #require(manager.itemMetadata(ocId: replacement.identifier) != nil)
+        let collision = MockEnumerationObserver(enumerator: newEnumerator)
+        await #expect(throws: NSFileProviderError(.cannotSynchronize)) {
+            try await collision.enumerateItems()
+        }
+        #expect(collision.items.isEmpty)
+        #expect(manager.itemMetadatas(account: previous.ncKitAccount).contains { $0.ocId == Self.fileId && !$0.deleted })
     }
 
     @Test(arguments: DAVReadScope.allCases, [true, false])
